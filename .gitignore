@@ -3,3 +3,5 @@ example/
 .DS_Store
 *.dSYM/
 .idea
+# R&D test files (local only)
+test_*.cpp

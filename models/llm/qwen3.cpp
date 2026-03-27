@@ -341,18 +341,36 @@ bool Qwen3Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
         snprintf(name2, sizeof(name2), "model.layers.%d.mlp.up_proj.weight", L);
         snprintf(name3, sizeof(name3), "model.layers.%d.mlp.down_proj.weight", L);
 
-        if (use_blobs) {
-            ane_layers_[L].fused_ffn = ane_compile_fused_ffn_blob(
-                blob_path(blob_dir, name), blob_path(blob_dir, name2),
-                blob_path(blob_dir, name3), hidden_size_, intermediate_size_);
-        } else {
-            ane_layers_[L].fused_ffn = ane_compile_fused_ffn(
-                sf->get_bf16_ptr(name), sf->get_bf16_ptr(name2),
-                sf->get_bf16_ptr(name3), hidden_size_, intermediate_size_);
+        int ffn_chunks = ane_ffn_chunk_count(hidden_size_, intermediate_size_);
+        if (ffn_chunks <= 1) {
+            if (use_blobs) {
+                ane_layers_[L].fused_ffn = ane_compile_fused_ffn_blob(
+                    blob_path(blob_dir, name), blob_path(blob_dir, name2),
+                    blob_path(blob_dir, name3), hidden_size_, intermediate_size_);
+            } else {
+                ane_layers_[L].fused_ffn = ane_compile_fused_ffn(
+                    sf->get_bf16_ptr(name), sf->get_bf16_ptr(name2),
+                    sf->get_bf16_ptr(name3), hidden_size_, intermediate_size_);
+            }
         }
         if (!ane_layers_[L].fused_ffn) {
-            fprintf(stderr, "ANE fused_ffn compile failed for layer %d\n", L);
-            return false;
+            if (ffn_chunks <= 1) ffn_chunks = 2;
+            if (L == 0) LOG("  Using chunked FFN (%d chunks, inter=%d)\n", ffn_chunks, intermediate_size_);
+            if (!use_blobs) {
+                if (!ane_compile_chunked_ffn(&ane_layers_[L].chunked_ffn,
+                        sf->get_bf16_ptr(name), sf->get_bf16_ptr(name2),
+                        sf->get_bf16_ptr(name3), hidden_size_, intermediate_size_, ffn_chunks)) {
+                    fprintf(stderr, "ANE chunked FFN compile failed for layer %d\n", L);
+                    return false;
+                }
+            } else {
+                if (!ane_compile_chunked_ffn_blob(&ane_layers_[L].chunked_ffn,
+                        blob_path(blob_dir, name), blob_path(blob_dir, name2),
+                        blob_path(blob_dir, name3), hidden_size_, intermediate_size_, ffn_chunks)) {
+                    fprintf(stderr, "ANE chunked FFN blob compile failed for layer %d\n", L);
+                    return false;
+                }
+            }
         }
     }
 
@@ -501,8 +519,18 @@ float* Qwen3Model::forward(int token_id, int pos) {
         rmsnorm(x_norm_, x_, layers_[L].post_attention_layernorm, hidden_size_, rms_eps_);
 
         float* mlp_out = scratch_attn_;
-        if (!ane_matvec(ane_layers_[L].fused_ffn, mlp_out, x_norm_, hidden_size_, hidden_size_)) {
-            fprintf(stderr, "ANE fused_ffn eval failed at layer %d\n", L);
+        if (ane_layers_[L].fused_ffn) {
+            if (!ane_matvec(ane_layers_[L].fused_ffn, mlp_out, x_norm_, hidden_size_, hidden_size_)) {
+                fprintf(stderr, "ANE fused_ffn eval failed at layer %d\n", L);
+                return nullptr;
+            }
+        } else if (ane_layers_[L].chunked_ffn.num_chunks > 0) {
+            if (!ane_eval_chunked_ffn(&ane_layers_[L].chunked_ffn, mlp_out, x_norm_)) {
+                fprintf(stderr, "ANE chunked_ffn eval failed at layer %d\n", L);
+                return nullptr;
+            }
+        } else {
+            fprintf(stderr, "No FFN kernel for layer %d\n", L);
             return nullptr;
         }
 

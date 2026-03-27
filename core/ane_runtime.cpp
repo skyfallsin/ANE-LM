@@ -397,6 +397,89 @@ static id mil_gen_fused_ffn(int dim, int inter_ch) {
     return ns_data(buf, n);
 }
 
+// ============ Chunked FFN: accumulator-chain MIL ============
+// Input: [1, 2*dim, 1, SP] = [x | accumulator] packed in channels
+// Output: [1, dim, 1, SP] = acc + down_proj(silu(gate(x)) * up(x))
+// All computation on ANE — host only packs input buffer between dispatches.
+
+static id mil_gen_ffn_chunk_accum(int dim, int chunk_inter) {
+    char buf[16384];
+    int n = snprintf(buf, sizeof(buf),
+        MIL_HEADER
+        "    func main<ios16>(tensor<fp16, [1, %d, 1, %d]> packed) {\n"
+        // Slice constants
+        "        tensor<int32, [4]> sb0 = const()[name = tensor<string, []>(\"sb0\"), val = tensor<int32, [4]>([0, 0, 0, 0])];\n"
+        "        tensor<int32, [4]> se0 = const()[name = tensor<string, []>(\"se0\"), val = tensor<int32, [4]>([1, %d, 1, %d])];\n"
+        "        tensor<int32, [4]> sb1 = const()[name = tensor<string, []>(\"sb1\"), val = tensor<int32, [4]>([0, %d, 0, 0])];\n"
+        "        tensor<int32, [4]> se1 = const()[name = tensor<string, []>(\"se1\"), val = tensor<int32, [4]>([1, %d, 1, %d])];\n"
+        // Slice x and acc from packed input
+        "        tensor<fp16, [1, %d, 1, %d]> x = slice_by_index(x = packed, begin = sb0, end = se0)"
+        "[name = tensor<string, []>(\"sx\")];\n"
+        "        tensor<fp16, [1, %d, 1, %d]> acc = slice_by_index(x = packed, begin = sb1, end = se1)"
+        "[name = tensor<string, []>(\"sa\")];\n"
+        // Conv constants
+        "        tensor<string, []> pt = const()[name = tensor<string, []>(\"pt\"), val = tensor<string, []>(\"valid\")];\n"
+        "        tensor<int32, [2]> st = const()[name = tensor<string, []>(\"st\"), val = tensor<int32, [2]>([1, 1])];\n"
+        "        tensor<int32, [4]> pd = const()[name = tensor<string, []>(\"pd\"), val = tensor<int32, [4]>([0, 0, 0, 0])];\n"
+        "        tensor<int32, [2]> dl = const()[name = tensor<string, []>(\"dl\"), val = tensor<int32, [2]>([1, 1])];\n"
+        "        tensor<int32, []> gr = const()[name = tensor<string, []>(\"gr\"), val = tensor<int32, []>(1)];\n"
+        // Weight constants
+        "        tensor<fp16, [%d, %d, 1, 1]> Wg = const()[name = tensor<string, []>(\"Wg\"), "
+        "val = tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE(path = tensor<string, []>(\"@model_path/weights/wg.bin\"), offset = tensor<uint64, []>(64)))];\n"
+        "        tensor<fp16, [%d, %d, 1, 1]> Wu = const()[name = tensor<string, []>(\"Wu\"), "
+        "val = tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE(path = tensor<string, []>(\"@model_path/weights/wu.bin\"), offset = tensor<uint64, []>(64)))];\n"
+        "        tensor<fp16, [%d, %d, 1, 1]> Wd = const()[name = tensor<string, []>(\"Wd\"), "
+        "val = tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE(path = tensor<string, []>(\"@model_path/weights/wd.bin\"), offset = tensor<uint64, []>(64)))];\n"
+        // gate + up projections
+        "        tensor<fp16, [1, %d, 1, %d]> gate = conv(dilations = dl, groups = gr, pad = pd, "
+        "pad_type = pt, strides = st, weight = Wg, x = x)[name = tensor<string, []>(\"cg\")];\n"
+        "        tensor<fp16, [1, %d, 1, %d]> up = conv(dilations = dl, groups = gr, pad = pd, "
+        "pad_type = pt, strides = st, weight = Wu, x = x)[name = tensor<string, []>(\"cu\")];\n"
+        // SiLU activation
+        "        tensor<fp16, [1, %d, 1, %d]> sig = sigmoid(x = gate)[name = tensor<string, []>(\"sg\")];\n"
+        "        tensor<fp16, [1, %d, 1, %d]> silu = mul(x = gate, y = sig)[name = tensor<string, []>(\"sl\")];\n"
+        "        tensor<fp16, [1, %d, 1, %d]> fused = mul(x = silu, y = up)[name = tensor<string, []>(\"fu\")];\n"
+        // down projection (partial)
+        "        tensor<fp16, [1, %d, 1, %d]> partial = conv(dilations = dl, groups = gr, pad = pd, "
+        "pad_type = pt, strides = st, weight = Wd, x = fused)[name = tensor<string, []>(\"cd\")];\n"
+        // Accumulate on ANE
+        "        tensor<fp16, [1, %d, 1, %d]> out = add(x = acc, y = partial)[name = tensor<string, []>(\"ad\")];\n"
+        "    } -> (out);\n"
+        "}\n",
+        /* packed input */ 2 * dim, SP,
+        /* se0 */ dim, SP,
+        /* sb1 */ dim,
+        /* se1 */ 2 * dim, SP,
+        /* x slice */ dim, SP,
+        /* acc slice */ dim, SP,
+        /* Wg */ chunk_inter, dim, chunk_inter, dim,
+        /* Wu */ chunk_inter, dim, chunk_inter, dim,
+        /* Wd */ dim, chunk_inter, dim, chunk_inter,
+        /* gate */ chunk_inter, SP,
+        /* up */ chunk_inter, SP,
+        /* sig */ chunk_inter, SP,
+        /* silu */ chunk_inter, SP,
+        /* fused */ chunk_inter, SP,
+        /* partial */ dim, SP,
+        /* out */ dim, SP);
+    return ns_data(buf, n);
+}
+
+// Determine how many chunks needed so each fits under ANE compile limit.
+// LM head matmul kernels compile fine at ~34MB (16384*1024*2). Fused FFN
+// with 3 weight matrices works at ~22MB total (0.8B). Conservative limit
+// per chunk: 48MB (single kernels can be larger than fused multi-weight ones).
+static constexpr size_t ANE_FFN_CHUNK_MAX_BYTES = 48 * 1024 * 1024;
+
+int ane_ffn_chunk_count(int dim, int inter_ch) {
+    size_t total = (size_t)3 * inter_ch * dim * 2; // 3 matrices, fp16
+    if (total <= ANE_FFN_CHUNK_MAX_BYTES) return 1;
+    int n = (int)((total + ANE_FFN_CHUNK_MAX_BYTES - 1) / ANE_FFN_CHUNK_MAX_BYTES);
+    // Round up to a divisor of inter_ch
+    while (inter_ch % n != 0) n++;
+    return n;
+}
+
 // ============ Core compile/eval/free ============
 
 static ANEKernel* ane_compile_raw(id milText, id wdict,
@@ -663,6 +746,7 @@ void ane_free_layer(LayerANEKernels* lk) {
     ane_free(lk->first_proj);
     ane_free(lk->o_proj);
     ane_free(lk->fused_ffn);
+    ane_free_chunked_ffn(&lk->chunked_ffn);
     lk->first_proj = lk->o_proj = lk->fused_ffn = nullptr;
 }
 
@@ -847,6 +931,599 @@ ANEKernel* ane_compile_fused_ffn_blob(const std::string& gate_path, const std::s
     ANEKernel* r = ane_compile_raw(mil, wdict, 1, &in_size, 1, &out_size);
     objc_autoreleasePoolPop(pool);
     return r;
+}
+
+// ============ Chunked FFN compile/eval ============
+
+// Helper: build weight blob from a SLICE of bf16 data
+// gate/up: rows [chunk_start..chunk_start+chunk_inter) of [inter_ch, dim] matrix
+// down:    cols [chunk_start..chunk_start+chunk_inter) of [dim, inter_ch] matrix
+static id build_weight_blob_rows(const uint16_t* bf16_data, int total_rows, int cols,
+                                  int row_start, int row_count) {
+    int numel = row_count * cols;
+    size_t wsize = (size_t)numel * 2;
+    size_t total = 64 + 64 + wsize;
+    uint8_t* buf = (uint8_t*)calloc(total, 1);
+    buf[0] = 0x01; buf[4] = 0x02;
+    uint8_t* chunk = buf + 64;
+    chunk[0] = 0xEF; chunk[1] = 0xBE; chunk[2] = 0xAD; chunk[3] = 0xDE;
+    chunk[4] = 0x01;
+    *(uint32_t*)(chunk + 8) = (uint32_t)wsize;
+    *(uint32_t*)(chunk + 16) = 128;
+
+    uint16_t* fp16 = (uint16_t*)(buf + 128);
+    const uint16_t* src = bf16_data + (size_t)row_start * cols;
+    bf16_to_f16_vec(fp16, src, numel);
+    return ns_data_nocopy(buf, total);
+}
+
+// down_proj is [dim, inter_ch] — we need cols [chunk_start..+chunk_inter)
+// In memory layout (row-major): row r, col c = data[r * inter_ch + c]
+// We extract a submatrix [dim, chunk_inter]
+static id build_weight_blob_cols(const uint16_t* bf16_data, int rows, int total_cols,
+                                  int col_start, int col_count) {
+    int numel = rows * col_count;
+    size_t wsize = (size_t)numel * 2;
+    size_t total = 64 + 64 + wsize;
+    uint8_t* buf = (uint8_t*)calloc(total, 1);
+    buf[0] = 0x01; buf[4] = 0x02;
+    uint8_t* chunk = buf + 64;
+    chunk[0] = 0xEF; chunk[1] = 0xBE; chunk[2] = 0xAD; chunk[3] = 0xDE;
+    chunk[4] = 0x01;
+    *(uint32_t*)(chunk + 8) = (uint32_t)wsize;
+    *(uint32_t*)(chunk + 16) = 128;
+
+    uint16_t* fp16 = (uint16_t*)(buf + 128);
+    for (int r = 0; r < rows; r++) {
+        const uint16_t* src_row = bf16_data + (size_t)r * total_cols + col_start;
+        uint16_t* dst_row = fp16 + (size_t)r * col_count;
+        bf16_to_f16_vec(dst_row, src_row, col_count);
+    }
+    return ns_data_nocopy(buf, total);
+}
+
+bool ane_compile_chunked_ffn(ChunkedFFN* out, const uint16_t* gate_bf16,
+                              const uint16_t* up_bf16, const uint16_t* down_bf16,
+                              int dim, int inter_ch, int num_chunks) {
+    int chunk_inter = inter_ch / num_chunks;
+    out->chunks = (ANEKernel**)calloc(num_chunks, sizeof(ANEKernel*));
+    out->num_chunks = num_chunks;
+    out->dim = dim;
+    out->chunk_inter = chunk_inter;
+
+    id mil = mil_gen_ffn_chunk_accum(dim, chunk_inter);
+    size_t in_size = (size_t)(2 * dim) * SP * sizeof(uint16_t);
+    size_t out_size = (size_t)dim * SP * sizeof(uint16_t);
+
+    for (int c = 0; c < num_chunks; c++) {
+        void* pool = objc_autoreleasePoolPush();
+        int offset = c * chunk_inter;
+
+        // gate/up: slice rows [offset..offset+chunk_inter) of [inter_ch, dim]
+        id wg = build_weight_blob_rows(gate_bf16, inter_ch, dim, offset, chunk_inter);
+        id wu = build_weight_blob_rows(up_bf16, inter_ch, dim, offset, chunk_inter);
+        // down: slice cols [offset..offset+chunk_inter) of [dim, inter_ch]
+        id wd = build_weight_blob_cols(down_bf16, dim, inter_ch, offset, chunk_inter);
+
+        id keys[]   = { ns_str("@model_path/weights/wg.bin"),
+                        ns_str("@model_path/weights/wu.bin"),
+                        ns_str("@model_path/weights/wd.bin") };
+        id values[] = { ns_weight_entry(wg), ns_weight_entry(wu), ns_weight_entry(wd) };
+        id wdict = ns_dict(keys, values, 3);
+
+        out->chunks[c] = ane_compile_raw(mil, wdict, 1, &in_size, 1, &out_size);
+        objc_autoreleasePoolPop(pool);
+
+        if (!out->chunks[c]) {
+            fprintf(stderr, "ANE chunked FFN compile failed at chunk %d/%d\n", c + 1, num_chunks);
+            ane_free_chunked_ffn(out);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ane_compile_chunked_ffn_blob(ChunkedFFN* out, const std::string& gate_path,
+                                   const std::string& up_path, const std::string& down_path,
+                                   int dim, int inter_ch, int num_chunks) {
+    // Load full blobs, extract bf16 data pointers, delegate to bf16 version
+    // For blob files: header is 128 bytes, then fp16 data (already converted)
+    // We need to slice them — load as raw, skip header, treat as bf16
+    FILE* fg = fopen(gate_path.c_str(), "rb");
+    FILE* fu = fopen(up_path.c_str(), "rb");
+    FILE* fd = fopen(down_path.c_str(), "rb");
+    if (!fg || !fu || !fd) {
+        if (fg) fclose(fg); if (fu) fclose(fu); if (fd) fclose(fd);
+        return false;
+    }
+
+    size_t gate_size = (size_t)inter_ch * dim;
+    size_t down_size = (size_t)dim * inter_ch;
+
+    // Blob files have 128-byte header then fp16 data
+    // But we need bf16 for the build_weight_blob helpers... 
+    // Actually blob files are already fp16. We'll handle this differently:
+    // Just fall back to the non-blob path since we need to slice anyway
+    fclose(fg); fclose(fu); fclose(fd);
+    fprintf(stderr, "Chunked FFN blob path not yet supported, use non-blob path\n");
+    return false;
+}
+
+// Eval: chain through all chunks. Host packs [x | acc] between dispatches.
+bool ane_eval_chunked_ffn(const ChunkedFFN* cffn, float* output, const float* input) {
+    int dim = cffn->dim;
+    int packed_ch = 2 * dim;
+
+    for (int c = 0; c < cffn->num_chunks; c++) {
+        ANEKernel* k = cffn->chunks[c];
+        IOSurfaceRef in_surface = k->ioInputs[0];
+
+        // Lock and write packed input: [x | acc]
+        if (IOSurfaceLock(in_surface, 0, NULL) != kIOReturnSuccess) return false;
+#if ANE_USE_NATIVE_FP16
+        ane_fp16_t* in_base = (ane_fp16_t*)IOSurfaceGetBaseAddress(in_surface);
+#else
+        uint16_t* in_base = (uint16_t*)IOSurfaceGetBaseAddress(in_surface);
+#endif
+
+        // Write x into first dim channels
+#pragma clang loop vectorize(enable)
+        for (int i = 0, idx = 0; i < dim; i++, idx += ANE_SPATIAL) {
+#if ANE_USE_NATIVE_FP16
+            in_base[idx] = (ane_fp16_t)input[i];
+#else
+            in_base[idx] = f32_to_f16(input[i]);
+#endif
+        }
+
+        // Write accumulator into next dim channels
+        if (c == 0) {
+            // First chunk: acc = zeros
+            for (int i = 0, idx = dim * ANE_SPATIAL; i < dim; i++, idx += ANE_SPATIAL) {
+#if ANE_USE_NATIVE_FP16
+                in_base[idx] = (ane_fp16_t)0.0f;
+#else
+                in_base[idx] = 0;
+#endif
+            }
+        } else {
+            // Subsequent chunks: acc = previous output (already in output buffer)
+            // Read from previous chunk's output surface and write to this chunk's input
+            IOSurfaceRef prev_out = cffn->chunks[c - 1]->ioOutputs[0];
+            if (IOSurfaceLock(prev_out, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) {
+                IOSurfaceUnlock(in_surface, 0, NULL);
+                return false;
+            }
+#if ANE_USE_NATIVE_FP16
+            const ane_fp16_t* prev_base = (const ane_fp16_t*)IOSurfaceGetBaseAddress(prev_out);
+#else
+            const uint16_t* prev_base = (const uint16_t*)IOSurfaceGetBaseAddress(prev_out);
+#endif
+            // Copy prev output (dim channels) into acc portion of packed input
+            size_t acc_offset = (size_t)dim * ANE_SPATIAL;
+#pragma clang loop vectorize(enable)
+            for (int i = 0, idx = 0; i < dim; i++, idx += ANE_SPATIAL) {
+                in_base[acc_offset + idx] = prev_base[idx];
+            }
+            IOSurfaceUnlock(prev_out, kIOSurfaceLockReadOnly, NULL);
+        }
+
+        IOSurfaceUnlock(in_surface, 0, NULL);
+
+        // Dispatch on ANE
+        if (!ane_eval_raw(k)) return false;
+    }
+
+    // Read final output from last chunk
+    ANEKernel* last = cffn->chunks[cffn->num_chunks - 1];
+    IOSurfaceRef out_surface = last->ioOutputs[0];
+    if (IOSurfaceLock(out_surface, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return false;
+#if ANE_USE_NATIVE_FP16
+    const ane_fp16_t* out_base = (const ane_fp16_t*)IOSurfaceGetBaseAddress(out_surface);
+#else
+    const uint16_t* out_base = (const uint16_t*)IOSurfaceGetBaseAddress(out_surface);
+#endif
+#pragma clang loop vectorize(enable)
+    for (int i = 0, idx = 0; i < dim; i++, idx += ANE_SPATIAL) {
+#if ANE_USE_NATIVE_FP16
+        output[i] = (float)out_base[idx];
+#else
+        output[i] = f16_to_f32(out_base[idx]);
+#endif
+    }
+    IOSurfaceUnlock(out_surface, kIOSurfaceLockReadOnly, NULL);
+    return true;
+}
+
+void ane_free_chunked_ffn(ChunkedFFN* cffn) {
+    if (!cffn || !cffn->chunks) return;
+    for (int i = 0; i < cffn->num_chunks; i++) ane_free(cffn->chunks[i]);
+    free(cffn->chunks);
+    cffn->chunks = nullptr;
+    cffn->num_chunks = 0;
+}
+
+// ============ Generic MIL compile ============
+
+ANEKernel* ane_compile_mil(const char* mil_text, int n_inputs, size_t* input_sizes,
+                            int n_outputs, size_t* output_sizes) {
+    if (!ane_available()) return nullptr;
+    void* pool = objc_autoreleasePoolPush();
+    id mil = ns_data(mil_text, strlen(mil_text));
+    ANEKernel* k = ane_compile_raw(mil, (id)nullptr, n_inputs, input_sizes, n_outputs, output_sizes);
+    objc_autoreleasePoolPop(pool);
+    return k;
+}
+
+// ============ Dynamic-weight conv ============
+// MIL program with TWO inputs: x and W (weights passed at runtime, not baked in)
+// Uses conv() op — ANE accepts non-constant weight inputs for conv!
+
+static id mil_gen_dynamic_conv(int out_dim, int in_dim) {
+    char buf[4096];
+    int n = snprintf(buf, sizeof(buf),
+        MIL_HEADER
+        "    func main<ios16>(tensor<fp16, [1, %d, 1, %d]> x, tensor<fp16, [%d, %d, 1, 1]> W) {\n"
+        "        tensor<string, []> pt = const()[name = tensor<string, []>(\"pt\"), val = tensor<string, []>(\"valid\")];\n"
+        "        tensor<int32, [2]> st = const()[name = tensor<string, []>(\"st\"), val = tensor<int32, [2]>([1, 1])];\n"
+        "        tensor<int32, [4]> pd = const()[name = tensor<string, []>(\"pd\"), val = tensor<int32, [4]>([0, 0, 0, 0])];\n"
+        "        tensor<int32, [2]> dl = const()[name = tensor<string, []>(\"dl\"), val = tensor<int32, [2]>([1, 1])];\n"
+        "        tensor<int32, []> gr = const()[name = tensor<string, []>(\"gr\"), val = tensor<int32, []>(1)];\n"
+        "        tensor<fp16, [1, %d, 1, %d]> y = conv(dilations = dl, groups = gr, "
+        "pad = pd, pad_type = pt, strides = st, weight = W, x = x)"
+        "[name = tensor<string, []>(\"cv\")];\n"
+        "    } -> (y);\n"
+        "}\n",
+        in_dim, SP, out_dim, in_dim,
+        out_dim, SP);
+    return ns_data(buf, n);
+}
+
+// Dynamic FFN: 4 inputs (x, gate_W, up_W, down_W), all conv ops with runtime weights
+static id mil_gen_dynamic_ffn_conv(int dim, int inter_ch) {
+    char buf[8192];
+    int n = snprintf(buf, sizeof(buf),
+        MIL_HEADER
+        "    func main<ios16>("
+        "tensor<fp16, [1, %d, 1, %d]> x, "
+        "tensor<fp16, [%d, %d, 1, 1]> Wg, "
+        "tensor<fp16, [%d, %d, 1, 1]> Wu, "
+        "tensor<fp16, [%d, %d, 1, 1]> Wd) {\n"
+        "        tensor<string, []> pt = const()[name = tensor<string, []>(\"pt\"), val = tensor<string, []>(\"valid\")];\n"
+        "        tensor<int32, [2]> st = const()[name = tensor<string, []>(\"st\"), val = tensor<int32, [2]>([1, 1])];\n"
+        "        tensor<int32, [4]> pd = const()[name = tensor<string, []>(\"pd\"), val = tensor<int32, [4]>([0, 0, 0, 0])];\n"
+        "        tensor<int32, [2]> dl = const()[name = tensor<string, []>(\"dl\"), val = tensor<int32, [2]>([1, 1])];\n"
+        "        tensor<int32, []> gr = const()[name = tensor<string, []>(\"gr\"), val = tensor<int32, []>(1)];\n"
+        // gate = Wg conv x
+        "        tensor<fp16, [1, %d, 1, %d]> gate = conv(dilations = dl, groups = gr, "
+        "pad = pd, pad_type = pt, strides = st, weight = Wg, x = x)"
+        "[name = tensor<string, []>(\"cg\")];\n"
+        // up = Wu conv x
+        "        tensor<fp16, [1, %d, 1, %d]> up = conv(dilations = dl, groups = gr, "
+        "pad = pd, pad_type = pt, strides = st, weight = Wu, x = x)"
+        "[name = tensor<string, []>(\"cu\")];\n"
+        // silu(gate) = gate * sigmoid(gate)
+        "        tensor<fp16, [1, %d, 1, %d]> sig = sigmoid(x = gate)[name = tensor<string, []>(\"sg\")];\n"
+        "        tensor<fp16, [1, %d, 1, %d]> silu = mul(x = gate, y = sig)[name = tensor<string, []>(\"sl\")];\n"
+        "        tensor<fp16, [1, %d, 1, %d]> fused = mul(x = silu, y = up)[name = tensor<string, []>(\"fu\")];\n"
+        // down = Wd conv fused
+        "        tensor<fp16, [1, %d, 1, %d]> out = conv(dilations = dl, groups = gr, "
+        "pad = pd, pad_type = pt, strides = st, weight = Wd, x = fused)"
+        "[name = tensor<string, []>(\"cd\")];\n"
+        "    } -> (out);\n"
+        "}\n",
+        /* inputs */ dim, SP, inter_ch, dim, inter_ch, dim, dim, inter_ch,
+        /* gate */ inter_ch, SP,
+        /* up */ inter_ch, SP,
+        /* sig */ inter_ch, SP,
+        /* silu */ inter_ch, SP,
+        /* fused */ inter_ch, SP,
+        /* down */ dim, SP);
+    return ns_data(buf, n);
+}
+
+ANEKernel* ane_compile_dynamic_conv(int out_dim, int in_dim) {
+    if (!ane_available()) return nullptr;
+    void* pool = objc_autoreleasePoolPush();
+    
+    id mil = mil_gen_dynamic_conv(out_dim, in_dim);
+    
+    // ANE 4D tensor format: [N, C, H, W] — innermost dim (W) is padded to SP=32
+    // For weight [out_dim, in_dim, 1, 1]: N=out_dim, C=in_dim, H=1, W=1
+    // Each (n,c,h) row has W=1 padded to SP=32
+    // Total IOSurface size: out_dim * in_dim * 1 * SP * sizeof(fp16)
+    size_t input_sizes[2] = {
+        (size_t)in_dim * SP * sizeof(uint16_t),              // x [1, in_dim, 1, SP]
+        (size_t)out_dim * in_dim * SP * sizeof(uint16_t)     // W [out_dim, in_dim, 1, 1] padded
+    };
+    size_t output_size = (size_t)out_dim * SP * sizeof(uint16_t);
+    
+    ANEKernel* k = ane_compile_raw(mil, (id)nullptr, 2, input_sizes, 1, &output_size);
+    objc_autoreleasePoolPop(pool);
+    return k;
+}
+
+bool ane_dynamic_conv_eval(ANEKernel* k, float* output, const float* input,
+                            const uint16_t* fp16_weights, int in_dim, int out_dim) {
+    if (!k) return false;
+    
+    // Write input x into IOSurface 0 (strided: every SP-th element)
+    IOSurfaceRef x_surf = k->ioInputs[0];
+    if (IOSurfaceLock(x_surf, 0, NULL) != kIOReturnSuccess) return false;
+#if ANE_USE_NATIVE_FP16
+    ane_fp16_t* x_base = (ane_fp16_t*)IOSurfaceGetBaseAddress(x_surf);
+#pragma clang loop vectorize(enable)
+    for (int c = 0, idx = 0; c < in_dim; c++, idx += SP)
+        x_base[idx] = (ane_fp16_t)input[c];
+#else
+    uint16_t* x_base = (uint16_t*)IOSurfaceGetBaseAddress(x_surf);
+    for (int c = 0, idx = 0; c < in_dim; c++, idx += SP)
+        x_base[idx] = f32_to_f16(input[c]);
+#endif
+    IOSurfaceUnlock(x_surf, 0, NULL);
+    
+    // Write weights into IOSurface 1
+    // ANE format for [out_dim, in_dim, 1, 1]: each element at stride SP
+    // Element [o, i, 0, 0] → offset (o * in_dim * SP + i * SP) * sizeof(fp16)
+    IOSurfaceRef w_surf = k->ioInputs[1];
+    if (IOSurfaceLock(w_surf, 0, NULL) != kIOReturnSuccess) return false;
+    uint16_t* w_base = (uint16_t*)IOSurfaceGetBaseAddress(w_surf);
+    // Zero the entire surface first (padding positions)
+    memset(w_base, 0, IOSurfaceGetAllocSize(w_surf));
+    // Write each weight element at its strided position
+    for (int o = 0; o < out_dim; o++) {
+        for (int i = 0; i < in_dim; i++) {
+            w_base[(size_t)o * in_dim * SP + (size_t)i * SP] = fp16_weights[(size_t)o * in_dim + i];
+        }
+    }
+    IOSurfaceUnlock(w_surf, 0, NULL);
+    
+    // Eval on ANE
+    if (!ane_eval_raw(k)) return false;
+    
+    // Read output (strided: every SP-th element)
+    IOSurfaceRef out_surf = k->ioOutputs[0];
+    if (IOSurfaceLock(out_surf, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return false;
+#if ANE_USE_NATIVE_FP16
+    const ane_fp16_t* out_base = (const ane_fp16_t*)IOSurfaceGetBaseAddress(out_surf);
+#pragma clang loop vectorize(enable)
+    for (int c = 0, idx = 0; c < out_dim; c++, idx += SP)
+        output[c] = (float)out_base[idx];
+#else
+    const uint16_t* out_base = (const uint16_t*)IOSurfaceGetBaseAddress(out_surf);
+    for (int c = 0, idx = 0; c < out_dim; c++, idx += SP)
+        output[c] = f16_to_f32(out_base[idx]);
+#endif
+    IOSurfaceUnlock(out_surf, kIOSurfaceLockReadOnly, NULL);
+    return true;
+}
+
+ANEKernel* ane_compile_dynamic_ffn(int dim, int inter_ch) {
+    if (!ane_available()) return nullptr;
+    void* pool = objc_autoreleasePoolPush();
+    
+    id mil = mil_gen_dynamic_ffn_conv(dim, inter_ch);
+    
+    // 4 inputs: x, gate_W, up_W, down_W — all with SP padding on innermost dim
+    size_t input_sizes[4] = {
+        (size_t)dim * SP * sizeof(uint16_t),                // x [1, dim, 1, SP]
+        (size_t)inter_ch * dim * SP * sizeof(uint16_t),     // Wg [inter, dim, 1, 1] padded
+        (size_t)inter_ch * dim * SP * sizeof(uint16_t),     // Wu [inter, dim, 1, 1] padded
+        (size_t)dim * inter_ch * SP * sizeof(uint16_t),     // Wd [dim, inter, 1, 1] padded
+    };
+    size_t output_size = (size_t)dim * SP * sizeof(uint16_t);
+    
+    ANEKernel* k = ane_compile_raw(mil, (id)nullptr, 4, input_sizes, 1, &output_size);
+    objc_autoreleasePoolPop(pool);
+    return k;
+}
+
+bool ane_dynamic_ffn_eval(ANEKernel* k, float* output, const float* input,
+                           const uint16_t* gate_fp16, const uint16_t* up_fp16,
+                           const uint16_t* down_fp16, int dim, int inter_ch) {
+    if (!k) return false;
+    
+    // Write x into IOSurface 0
+    IOSurfaceRef x_surf = k->ioInputs[0];
+    if (IOSurfaceLock(x_surf, 0, NULL) != kIOReturnSuccess) return false;
+#if ANE_USE_NATIVE_FP16
+    ane_fp16_t* x_base = (ane_fp16_t*)IOSurfaceGetBaseAddress(x_surf);
+    for (int c = 0, idx = 0; c < dim; c++, idx += SP)
+        x_base[idx] = (ane_fp16_t)input[c];
+#else
+    uint16_t* x_base = (uint16_t*)IOSurfaceGetBaseAddress(x_surf);
+    for (int c = 0, idx = 0; c < dim; c++, idx += SP)
+        x_base[idx] = f32_to_f16(input[c]);
+#endif
+    IOSurfaceUnlock(x_surf, 0, NULL);
+    
+    // Helper lambda: write fp16 weights with ANE SP stride into IOSurface
+    auto write_strided_weights = [](IOSurfaceRef surf, const uint16_t* src, int rows, int cols) -> bool {
+        if (IOSurfaceLock(surf, 0, NULL) != kIOReturnSuccess) return false;
+        uint16_t* base = (uint16_t*)IOSurfaceGetBaseAddress(surf);
+        memset(base, 0, IOSurfaceGetAllocSize(surf));
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < cols; c++)
+                base[(size_t)r * cols * SP + (size_t)c * SP] = src[(size_t)r * cols + c];
+        IOSurfaceUnlock(surf, 0, NULL);
+        return true;
+    };
+    
+    // Write gate weights [inter, dim] into IOSurface 1
+    if (!write_strided_weights(k->ioInputs[1], gate_fp16, inter_ch, dim)) return false;
+    // Write up weights [inter, dim] into IOSurface 2
+    if (!write_strided_weights(k->ioInputs[2], up_fp16, inter_ch, dim)) return false;
+    // Write down weights [dim, inter] into IOSurface 3
+    if (!write_strided_weights(k->ioInputs[3], down_fp16, dim, inter_ch)) return false;
+    
+    // Eval
+    if (!ane_eval_raw(k)) return false;
+    
+    // Read output
+    IOSurfaceRef out_surf = k->ioOutputs[0];
+    if (IOSurfaceLock(out_surf, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return false;
+#if ANE_USE_NATIVE_FP16
+    const ane_fp16_t* out_base = (const ane_fp16_t*)IOSurfaceGetBaseAddress(out_surf);
+    for (int c = 0, idx = 0; c < dim; c++, idx += SP)
+        output[c] = (float)out_base[idx];
+#else
+    const uint16_t* out_base = (const uint16_t*)IOSurfaceGetBaseAddress(out_surf);
+    for (int c = 0, idx = 0; c < dim; c++, idx += SP)
+        output[c] = f16_to_f32(out_base[idx]);
+#endif
+    IOSurfaceUnlock(out_surf, kIOSurfaceLockReadOnly, NULL);
+    return true;
+}
+
+// ============ Generic multi-input eval ============
+
+bool ane_eval_multi(ANEKernel* k,
+                    float** inputs, int* input_channels,
+                    float** outputs, int* output_channels) {
+    if (!k) return false;
+    
+    // Write all inputs (SP-strided fp16)
+    for (int i = 0; i < k->nInputs; i++) {
+        IOSurfaceRef surf = k->ioInputs[i];
+        if (IOSurfaceLock(surf, 0, NULL) != kIOReturnSuccess) return false;
+#if ANE_USE_NATIVE_FP16
+        ane_fp16_t* base = (ane_fp16_t*)IOSurfaceGetBaseAddress(surf);
+#else
+        uint16_t* base = (uint16_t*)IOSurfaceGetBaseAddress(surf);
+#endif
+        memset(base, 0, IOSurfaceGetAllocSize(surf));
+        int ch = input_channels[i];
+        for (int c = 0; c < ch; c++) {
+#if ANE_USE_NATIVE_FP16
+            base[(size_t)c * SP] = (ane_fp16_t)inputs[i][c];
+#else
+            base[(size_t)c * SP] = f32_to_f16(inputs[i][c]);
+#endif
+        }
+        IOSurfaceUnlock(surf, 0, NULL);
+    }
+    
+    // Eval
+    if (!ane_eval_raw(k)) return false;
+    
+    // Read all outputs (SP-strided fp16)
+    for (int i = 0; i < k->nOutputs; i++) {
+        IOSurfaceRef surf = k->ioOutputs[i];
+        if (IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return false;
+#if ANE_USE_NATIVE_FP16
+        const ane_fp16_t* base = (const ane_fp16_t*)IOSurfaceGetBaseAddress(surf);
+#else
+        const uint16_t* base = (const uint16_t*)IOSurfaceGetBaseAddress(surf);
+#endif
+        int ch = output_channels[i];
+        for (int c = 0; c < ch; c++) {
+#if ANE_USE_NATIVE_FP16
+            outputs[i][c] = (float)base[(size_t)c * SP];
+#else
+            outputs[i][c] = f16_to_f32(base[(size_t)c * SP]);
+#endif
+        }
+        IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+    }
+    return true;
+}
+
+bool ane_write_surface_raw(ANEKernel* k, int input_idx, const uint16_t* data, size_t bytes) {
+    if (!k || input_idx >= k->nInputs) return false;
+    IOSurfaceRef surf = k->ioInputs[input_idx];
+    if (IOSurfaceLock(surf, 0, NULL) != kIOReturnSuccess) return false;
+    size_t alloc = IOSurfaceGetAllocSize(surf);
+    size_t to_write = bytes < alloc ? bytes : alloc;
+    memset(IOSurfaceGetBaseAddress(surf), 0, alloc);
+    memcpy(IOSurfaceGetBaseAddress(surf), data, to_write);
+    IOSurfaceUnlock(surf, 0, NULL);
+    return true;
+}
+
+bool ane_write_surface_strided(ANEKernel* k, int input_idx, const uint16_t* data, int channels) {
+    if (!k || input_idx >= k->nInputs) return false;
+    IOSurfaceRef surf = k->ioInputs[input_idx];
+    if (IOSurfaceLock(surf, 0, NULL) != kIOReturnSuccess) return false;
+    uint16_t* base = (uint16_t*)IOSurfaceGetBaseAddress(surf);
+    memset(base, 0, IOSurfaceGetAllocSize(surf));
+    for (int c = 0; c < channels; c++)
+        base[(size_t)c * SP] = data[c];
+    IOSurfaceUnlock(surf, 0, NULL);
+    return true;
+}
+
+size_t ane_get_input_size(ANEKernel* k, int input_idx) {
+    if (!k || input_idx >= k->nInputs) return 0;
+    return k->inputBytes[input_idx];
+}
+
+size_t ane_get_output_size(ANEKernel* k, int output_idx) {
+    if (!k || output_idx >= k->nOutputs) return 0;
+    return k->outputBytes[output_idx];
+}
+
+int ane_get_n_inputs(ANEKernel* k) { return k ? k->nInputs : 0; }
+int ane_get_n_outputs(ANEKernel* k) { return k ? k->nOutputs : 0; }
+
+bool ane_eval_raw_outputs(ANEKernel* k, float** outputs, int* output_channels) {
+    if (!k) return false;
+    if (!ane_eval_raw(k)) return false;
+    for (int i = 0; i < k->nOutputs; i++) {
+        IOSurfaceRef surf = k->ioOutputs[i];
+        if (IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return false;
+#if ANE_USE_NATIVE_FP16
+        const ane_fp16_t* base = (const ane_fp16_t*)IOSurfaceGetBaseAddress(surf);
+#else
+        const uint16_t* base = (const uint16_t*)IOSurfaceGetBaseAddress(surf);
+#endif
+        int ch = output_channels[i];
+        for (int c = 0; c < ch; c++) {
+#if ANE_USE_NATIVE_FP16
+            outputs[i][c] = (float)base[(size_t)c * SP];
+#else
+            outputs[i][c] = f16_to_f32(base[(size_t)c * SP]);
+#endif
+        }
+        IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+    }
+    return true;
+}
+
+
+bool ane_read_output_raw(ANEKernel* k, int output_idx, float* data, int count) {
+    if (!k || output_idx >= k->nOutputs) return false;
+    IOSurfaceRef surf = k->ioOutputs[output_idx];
+    if (IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return false;
+    const uint16_t* base = (const uint16_t*)IOSurfaceGetBaseAddress(surf);
+    size_t alloc = IOSurfaceGetAllocSize(surf);
+    int max_count = (int)(alloc / sizeof(uint16_t));
+    if (count > max_count) count = max_count;
+#if ANE_USE_NATIVE_FP16
+    const ane_fp16_t* base_h = (const ane_fp16_t*)base;
+    for (int i = 0; i < count; i++) data[i] = (float)base_h[i];
+#else
+    for (int i = 0; i < count; i++) data[i] = f16_to_f32(base[i]);
+#endif
+    IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+    return true;
+}
+
+bool ane_write_input_tiled(ANEKernel* k, int input_idx, const float* data,
+                           int N, int C, int H, int W) {
+    if (!k || input_idx >= k->nInputs) return false;
+    IOSurfaceRef surf = k->ioInputs[input_idx];
+    if (IOSurfaceLock(surf, 0, NULL) != kIOReturnSuccess) return false;
+    uint16_t* base = (uint16_t*)IOSurfaceGetBaseAddress(surf);
+    memset(base, 0, IOSurfaceGetAllocSize(surf));
+    for (int n = 0; n < N; n++)
+        for (int c = 0; c < C; c++)
+            for (int h = 0; h < H; h++)
+                for (int w = 0; w < W; w++) {
+                    size_t idx = (size_t)(((n * C + c) * H + h) * W + w);
+                    base[idx] = f32_to_f16(data[idx]);
+                }
+    IOSurfaceUnlock(surf, 0, NULL);
+    return true;
 }
 
 } // namespace ane_lm
