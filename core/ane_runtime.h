@@ -81,6 +81,20 @@ int ane_ffn_chunk_count(int dim, int inter_ch);
 ANEKernel* ane_compile_mil(const char* mil_text, int n_inputs, size_t* input_sizes,
                             int n_outputs, size_t* output_sizes);
 
+// Generic MIL compile with named BF16 weight blobs
+// weight_names: array of N names (e.g. "weight", "wa")
+// weight_bf16:  array of N bf16 data pointers
+// weight_numel: array of N element counts
+struct MILWeight {
+    const char* name;         // e.g. "weight" → @model_path/weights/weight.bin
+    const uint16_t* bf16;     // BF16 data pointer
+    int numel;                // number of elements
+};
+ANEKernel* ane_compile_mil_weighted(const char* mil_text,
+                                     int n_inputs, size_t* input_sizes,
+                                     int n_outputs, size_t* output_sizes,
+                                     MILWeight* weights, int n_weights);
+
 // Dynamic-weight conv
 ANEKernel* ane_compile_dynamic_conv(int out_dim, int in_dim);
 bool ane_dynamic_conv_eval(ANEKernel* k, float* output, const float* input,

@@ -660,11 +660,18 @@ static ANEKernel* ane_compile_raw(id milText, id wdict,
     return k;
 }
 
+// Cached ObjC objects for hot-path eval — avoid per-call objc_msgSend overhead
+static id g_eval_empty_dict = nullptr;
+static SEL g_eval_sel = nullptr;
+
 static bool ane_eval_raw(ANEKernel* k) {
+    if (__builtin_expect(!g_eval_sel, 0)) {
+        g_eval_sel = sel("evaluateWithQoS:options:request:error:");
+        g_eval_empty_dict = objc_retain_obj(ns_empty_dict());
+    }
     id e = nullptr;
     bool ok = ((bool(*)(id,SEL,unsigned int,id,id,id*))objc_msgSend)(
-        k->model, sel("evaluateWithQoS:options:request:error:"),
-        21, ns_empty_dict(), k->request, &e);
+        k->model, g_eval_sel, 21, g_eval_empty_dict, k->request, &e);
     if (!ok) {
         fprintf(stderr, "ANE eval failed: %s\n",
             e ? to_cstr(((id(*)(id,SEL))objc_msgSend)(e, sel("description"))) : "unknown");
@@ -681,46 +688,58 @@ typedef __fp16 ane_fp16_t;
 #define ANE_USE_NATIVE_FP16 0
 #endif
 
+// Skip IOSurface lock/unlock on hot path — ANE hardware manages coherency via eval.
+// The lock/unlock is only needed for initial setup; once surfaces are allocated and
+// base addresses cached, direct memory access works.
+// Set ANE_SKIP_LOCKS=1 to enable.
+static bool g_skip_locks = false;
+static bool g_skip_locks_checked = false;
+
 bool ane_matvec(ANEKernel* k, float* output, const float* input, int in_dim, int out_dim) {
+    if (__builtin_expect(!g_skip_locks_checked, 0)) {
+        g_skip_locks = getenv("ANE_SKIP_LOCKS") != nullptr;
+        g_skip_locks_checked = true;
+    }
+
     IOSurfaceRef in_surface = k->ioInputs[0];
-    if (IOSurfaceLock(in_surface, 0, NULL) != kIOReturnSuccess) {
-        fprintf(stderr, "ANE: IOSurfaceLock(input) failed\n");
-        return false;
+    if (!g_skip_locks) {
+        if (IOSurfaceLock(in_surface, 0, NULL) != kIOReturnSuccess) {
+            fprintf(stderr, "ANE: IOSurfaceLock(input) failed\n");
+            return false;
+        }
     }
     uint16_t* in_base = (uint16_t*)IOSurfaceGetBaseAddress(in_surface);
 #if ANE_USE_NATIVE_FP16
     ane_fp16_t* in_base_h = (ane_fp16_t*)in_base;
-#endif
 #pragma clang loop vectorize(enable)
-    for (int c = 0, idx = 0; c < in_dim; c++, idx += ANE_SPATIAL) {
-#if ANE_USE_NATIVE_FP16
+    for (int c = 0, idx = 0; c < in_dim; c++, idx += ANE_SPATIAL)
         in_base_h[idx] = (ane_fp16_t)input[c];
 #else
+    for (int c = 0, idx = 0; c < in_dim; c++, idx += ANE_SPATIAL)
         in_base[idx] = f32_to_f16(input[c]);
 #endif
-    }
-    IOSurfaceUnlock(in_surface, 0, NULL);
+    if (!g_skip_locks) IOSurfaceUnlock(in_surface, 0, NULL);
 
     if (!ane_eval_raw(k)) return false;
 
     IOSurfaceRef out_surface = k->ioOutputs[0];
-    if (IOSurfaceLock(out_surface, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) {
-        fprintf(stderr, "ANE: IOSurfaceLock(output) failed\n");
-        return false;
+    if (!g_skip_locks) {
+        if (IOSurfaceLock(out_surface, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) {
+            fprintf(stderr, "ANE: IOSurfaceLock(output) failed\n");
+            return false;
+        }
     }
     const uint16_t* out_base = (const uint16_t*)IOSurfaceGetBaseAddress(out_surface);
 #if ANE_USE_NATIVE_FP16
     const ane_fp16_t* out_base_h = (const ane_fp16_t*)out_base;
-#endif
 #pragma clang loop vectorize(enable)
-    for (int c = 0, idx = 0; c < out_dim; c++, idx += ANE_SPATIAL) {
-#if ANE_USE_NATIVE_FP16
+    for (int c = 0, idx = 0; c < out_dim; c++, idx += ANE_SPATIAL)
         output[c] = (float)out_base_h[idx];
 #else
+    for (int c = 0, idx = 0; c < out_dim; c++, idx += ANE_SPATIAL)
         output[c] = f16_to_f32(out_base[idx]);
 #endif
-    }
-    IOSurfaceUnlock(out_surface, kIOSurfaceLockReadOnly, NULL);
+    if (!g_skip_locks) IOSurfaceUnlock(out_surface, kIOSurfaceLockReadOnly, NULL);
 
     return true;
 }
@@ -1151,6 +1170,35 @@ ANEKernel* ane_compile_mil(const char* mil_text, int n_inputs, size_t* input_siz
     void* pool = objc_autoreleasePoolPush();
     id mil = ns_data(mil_text, strlen(mil_text));
     ANEKernel* k = ane_compile_raw(mil, (id)nullptr, n_inputs, input_sizes, n_outputs, output_sizes);
+    objc_autoreleasePoolPop(pool);
+    return k;
+}
+
+// ============ Generic MIL compile with weight blobs ============
+
+ANEKernel* ane_compile_mil_weighted(const char* mil_text,
+                                     int n_inputs, size_t* input_sizes,
+                                     int n_outputs, size_t* output_sizes,
+                                     MILWeight* weights, int n_weights) {
+    if (!ane_available()) return nullptr;
+    void* pool = objc_autoreleasePoolPush();
+    id mil = ns_data(mil_text, strlen(mil_text));
+
+    // Build weight dict from MILWeight array
+    id wdict = (id)nullptr;
+    if (n_weights > 0) {
+        id* keys = (id*)alloca(n_weights * sizeof(id));
+        id* values = (id*)alloca(n_weights * sizeof(id));
+        for (int i = 0; i < n_weights; i++) {
+            char kbuf[128];
+            snprintf(kbuf, sizeof(kbuf), "@model_path/weights/%s.bin", weights[i].name);
+            keys[i] = ns_str(kbuf);
+            values[i] = ns_weight_entry(build_weight_blob(weights[i].bf16, weights[i].numel));
+        }
+        wdict = ns_dict(keys, values, (unsigned long)n_weights);
+    }
+
+    ANEKernel* k = ane_compile_raw(mil, wdict, n_inputs, input_sizes, n_outputs, output_sizes);
     objc_autoreleasePoolPop(pool);
     return k;
 }
