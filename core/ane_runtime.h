@@ -26,6 +26,7 @@ struct LayerANEKernels {
     ANEKernel* o_proj = nullptr;
     ANEKernel* fused_ffn = nullptr;
     ChunkedFFN chunked_ffn = {};
+    ANEKernel* fused_oproj_norm = nullptr;  // conv(O_proj) → add(res) → RMSNorm [2 outputs: x_norm, x_updated]
 };
 
 // Global state
@@ -64,6 +65,21 @@ ANEKernel* ane_compile_fused_ffn_blob(const std::string& gate_path, const std::s
 bool ane_compile_chunked_ffn_blob(ChunkedFFN* out, const std::string& gate_path,
                                    const std::string& up_path, const std::string& down_path,
                                    int dim, int inter_ch, int num_chunks);
+
+// Fused O_proj + residual add + RMSNorm kernel
+// 2 inputs: attn_out [in_dim], x_residual [out_dim]
+// 2 outputs: x_norm [out_dim], x_updated [out_dim] (residual after add, before norm)
+ANEKernel* ane_compile_fused_oproj_norm(const uint16_t* oproj_bf16,
+                                         const float* norm_weight,
+                                         int out_dim, int in_dim, float eps);
+ANEKernel* ane_compile_fused_oproj_norm_blob(const std::string& oproj_path,
+                                              const float* norm_weight,
+                                              int out_dim, int in_dim, float eps);
+
+// Eval fused O_proj+norm: returns x_norm and x_updated
+bool ane_eval_fused_oproj_norm(ANEKernel* k, float* x_norm, float* x_updated,
+                                const float* attn_out, const float* x_residual,
+                                int in_dim, int out_dim);
 
 // Kernel execution
 bool ane_matvec(ANEKernel* k, float* output, const float* input, int in_dim, int out_dim);

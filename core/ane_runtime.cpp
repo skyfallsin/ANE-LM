@@ -765,8 +765,9 @@ void ane_free_layer(LayerANEKernels* lk) {
     ane_free(lk->first_proj);
     ane_free(lk->o_proj);
     ane_free(lk->fused_ffn);
+    ane_free(lk->fused_oproj_norm);
     ane_free_chunked_ffn(&lk->chunked_ffn);
-    lk->first_proj = lk->o_proj = lk->fused_ffn = nullptr;
+    lk->first_proj = lk->o_proj = lk->fused_ffn = lk->fused_oproj_norm = nullptr;
 }
 
 // ============ High-level compile functions ============
@@ -810,6 +811,224 @@ ANEKernel* ane_compile_fused_3(const uint16_t* bf16_a, int a_out,
     ANEKernel* r = ane_compile_raw(mil, wdict, 1, &in_bytes, 1, &out_bytes);
     objc_autoreleasePoolPop(pool);
     return r;
+}
+
+// Forward declaration (defined later in blob section)
+static id load_blob_file(const std::string& path);
+
+// ============ Fused O_proj + residual add + RMSNorm ============
+// 2 inputs:  attn_out [1, in_dim, 1, SP], x_residual [1, out_dim, 1, SP]
+// 2 outputs: x_norm [1, out_dim, 1, SP], x_updated [1, out_dim, 1, SP]
+// Ops: conv(O_proj, attn_out) → add(x_residual, o_proj_result) → RMSNorm → output both
+
+static id mil_gen_fused_oproj_norm(int out_dim, int in_dim) {
+    // out_dim = hidden_size (O_proj output, norm dim)
+    // in_dim  = full_out_dim (O_proj input, attn head concat)
+    std::string s;
+    char buf[512];
+    s += MIL_HEADER;
+    snprintf(buf, sizeof(buf),
+        "    func main<ios16>(tensor<fp16, [1, %d, 1, %d]> attn,"
+        " tensor<fp16, [1, %d, 1, %d]> xres) {\n", in_dim, SP, out_dim, SP);
+    s += buf;
+
+    // Conv params (shared)
+    s += "        tensor<string, []> pt = const()[name = tensor<string, []>(\"pt\"), val = tensor<string, []>(\"valid\")];\n"
+         "        tensor<int32, [2]> st = const()[name = tensor<string, []>(\"st\"), val = tensor<int32, [2]>([1, 1])];\n"
+         "        tensor<int32, [4]> pd = const()[name = tensor<string, []>(\"pd\"), val = tensor<int32, [4]>([0, 0, 0, 0])];\n"
+         "        tensor<int32, [2]> dl = const()[name = tensor<string, []>(\"dl\"), val = tensor<int32, [2]>([1, 1])];\n"
+         "        tensor<int32, []> gr = const()[name = tensor<string, []>(\"gr\"), val = tensor<int32, []>(1)];\n";
+
+    // O_proj conv
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [%d, %d, 1, 1]> Wo = const()[name = tensor<string, []>(\"Wo\"), "
+        "val = tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE(path = tensor<string, []>"
+        "(\"@model_path/weights/oproj.bin\"), offset = tensor<uint64, []>(64)))];\n",
+        out_dim, in_dim, out_dim, in_dim);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> oproj = conv(dilations = dl, groups = gr, "
+        "pad = pd, pad_type = pt, strides = st, weight = Wo, x = attn)"
+        "[name = tensor<string, []>(\"op\")];\n", out_dim, SP);
+    s += buf;
+
+    // Residual add
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> x = add(x = xres, y = oproj)"
+        "[name = tensor<string, []>(\"ad\")];\n", out_dim, SP);
+    s += buf;
+
+    // RMSNorm: x² → reduce_sum → ×(1/dim) → +eps → sqrt → 1/sqrt → ×x → ×weight
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> sq = mul(x = x, y = x)"
+        "[name = tensor<string, []>(\"sq\")];\n", out_dim, SP);
+    s += buf;
+    s += "        tensor<int32, [1]> axes = const()[name = tensor<string, []>(\"ax\"), val = tensor<int32, [1]>([1])];\n"
+         "        tensor<bool, []> kd = const()[name = tensor<string, []>(\"kd\"), val = tensor<bool, []>(true)];\n";
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, 1, 1, %d]> ss = reduce_sum(x = sq, axes = axes, keep_dims = kd)"
+        "[name = tensor<string, []>(\"rs\")];\n", SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, 1, 1, %d]> di = const()[name = tensor<string, []>(\"di\"), "
+        "val = tensor<fp16, [1, 1, 1, %d]>(BLOBFILE(path = tensor<string, []>"
+        "(\"@model_path/weights/dim_inv.bin\"), offset = tensor<uint64, []>(64)))];\n", SP, SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, 1, 1, %d]> ms = mul(x = ss, y = di)"
+        "[name = tensor<string, []>(\"ms\")];\n", SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, 1, 1, %d]> ep = const()[name = tensor<string, []>(\"ep\"), "
+        "val = tensor<fp16, [1, 1, 1, %d]>(BLOBFILE(path = tensor<string, []>"
+        "(\"@model_path/weights/eps.bin\"), offset = tensor<uint64, []>(64)))];\n", SP, SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, 1, 1, %d]> ae = add(x = ms, y = ep)"
+        "[name = tensor<string, []>(\"ae\")];\n", SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, 1, 1, %d]> sr = sqrt(x = ae)"
+        "[name = tensor<string, []>(\"sr\")];\n", SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, 1, 1, %d]> on = const()[name = tensor<string, []>(\"on\"), "
+        "val = tensor<fp16, [1, 1, 1, %d]>(BLOBFILE(path = tensor<string, []>"
+        "(\"@model_path/weights/ones.bin\"), offset = tensor<uint64, []>(64)))];\n", SP, SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, 1, 1, %d]> sc = real_div(x = on, y = sr)"
+        "[name = tensor<string, []>(\"is\")];\n", SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> xs = mul(x = x, y = sc)"
+        "[name = tensor<string, []>(\"xs\")];\n", out_dim, SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> wn = const()[name = tensor<string, []>(\"wn\"), "
+        "val = tensor<fp16, [1, %d, 1, %d]>(BLOBFILE(path = tensor<string, []>"
+        "(\"@model_path/weights/nw.bin\"), offset = tensor<uint64, []>(64)))];\n",
+        out_dim, SP, out_dim, SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> normed = mul(x = xs, y = wn)"
+        "[name = tensor<string, []>(\"nm\")];\n", out_dim, SP);
+    s += buf;
+
+    // Two outputs: normed (for FFN) and x (updated residual)
+    s += "    } -> (normed, x);\n}\n";
+    return ns_data(s.c_str(), s.size());
+}
+
+// Build a BF16 weight blob from float* norm weights, laid out as [dim, SP] with one value per row
+static id build_norm_weight_blob(const float* norm_weight, int dim) {
+    int numel = dim * SP;
+    uint16_t* bf16 = (uint16_t*)calloc(numel, sizeof(uint16_t));
+    for (int i = 0; i < dim; i++)
+        bf16[i * SP] = f32_to_bf16(norm_weight[i]);
+    id blob = build_weight_blob(bf16, numel);
+    free(bf16);
+    return blob;
+}
+
+// Build scalar const blob [1, 1, 1, SP] with value in position 0
+static id build_scalar_blob(float value) {
+    uint16_t bf16[SP] = {};
+    bf16[0] = f32_to_bf16(value);
+    return build_weight_blob(bf16, SP);
+}
+
+ANEKernel* ane_compile_fused_oproj_norm(const uint16_t* oproj_bf16,
+                                         const float* norm_weight,
+                                         int out_dim, int in_dim, float eps) {
+    void* pool = objc_autoreleasePoolPush();
+
+    id w_oproj = build_weight_blob(oproj_bf16, out_dim * in_dim);
+    id w_nw = build_norm_weight_blob(norm_weight, out_dim);
+    id w_di = build_scalar_blob(1.0f / out_dim);
+    id w_ep = build_scalar_blob(eps);
+    id w_on = build_scalar_blob(1.0f);
+
+    id keys[] = {
+        ns_str("@model_path/weights/oproj.bin"),
+        ns_str("@model_path/weights/nw.bin"),
+        ns_str("@model_path/weights/dim_inv.bin"),
+        ns_str("@model_path/weights/eps.bin"),
+        ns_str("@model_path/weights/ones.bin"),
+    };
+    id values[] = {
+        ns_weight_entry(w_oproj),
+        ns_weight_entry(w_nw),
+        ns_weight_entry(w_di),
+        ns_weight_entry(w_ep),
+        ns_weight_entry(w_on),
+    };
+    id wdict = ns_dict(keys, values, 5);
+
+    id mil = mil_gen_fused_oproj_norm(out_dim, in_dim);
+    size_t in_sizes[2] = {
+        (size_t)in_dim * SP * sizeof(uint16_t),
+        (size_t)out_dim * SP * sizeof(uint16_t),
+    };
+    size_t out_sizes[2] = {
+        (size_t)out_dim * SP * sizeof(uint16_t),
+        (size_t)out_dim * SP * sizeof(uint16_t),
+    };
+    ANEKernel* r = ane_compile_raw(mil, wdict, 2, in_sizes, 2, out_sizes);
+    objc_autoreleasePoolPop(pool);
+    return r;
+}
+
+ANEKernel* ane_compile_fused_oproj_norm_blob(const std::string& oproj_path,
+                                              const float* norm_weight,
+                                              int out_dim, int in_dim, float eps) {
+    void* pool = objc_autoreleasePoolPush();
+
+    id w_oproj = load_blob_file(oproj_path);
+    if (!w_oproj) { objc_autoreleasePoolPop(pool); return nullptr; }
+    id w_nw = build_norm_weight_blob(norm_weight, out_dim);
+    id w_di = build_scalar_blob(1.0f / out_dim);
+    id w_ep = build_scalar_blob(eps);
+    id w_on = build_scalar_blob(1.0f);
+
+    id keys[] = {
+        ns_str("@model_path/weights/oproj.bin"),
+        ns_str("@model_path/weights/nw.bin"),
+        ns_str("@model_path/weights/dim_inv.bin"),
+        ns_str("@model_path/weights/eps.bin"),
+        ns_str("@model_path/weights/ones.bin"),
+    };
+    id values[] = {
+        ns_weight_entry(w_oproj),
+        ns_weight_entry(w_nw),
+        ns_weight_entry(w_di),
+        ns_weight_entry(w_ep),
+        ns_weight_entry(w_on),
+    };
+    id wdict = ns_dict(keys, values, 5);
+
+    id mil = mil_gen_fused_oproj_norm(out_dim, in_dim);
+    size_t in_sizes[2] = {
+        (size_t)in_dim * SP * sizeof(uint16_t),
+        (size_t)out_dim * SP * sizeof(uint16_t),
+    };
+    size_t out_sizes[2] = {
+        (size_t)out_dim * SP * sizeof(uint16_t),
+        (size_t)out_dim * SP * sizeof(uint16_t),
+    };
+    ANEKernel* r = ane_compile_raw(mil, wdict, 2, in_sizes, 2, out_sizes);
+    objc_autoreleasePoolPop(pool);
+    return r;
+}
+
+bool ane_eval_fused_oproj_norm(ANEKernel* k, float* x_norm, float* x_updated,
+                                const float* attn_out, const float* x_residual,
+                                int in_dim, int out_dim) {
+    float* ins[2] = { (float*)attn_out, (float*)x_residual };
+    int in_chs[2] = { in_dim, out_dim };
+    float* outs[2] = { x_norm, x_updated };
+    int out_chs[2] = { out_dim, out_dim };
+    return ane_eval_multi(k, ins, in_chs, outs, out_chs);
 }
 
 ANEKernel* ane_compile_fused_ffn(const uint16_t* gate_bf16, const uint16_t* up_bf16,
