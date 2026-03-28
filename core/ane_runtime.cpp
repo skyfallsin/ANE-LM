@@ -766,8 +766,9 @@ void ane_free_layer(LayerANEKernels* lk) {
     ane_free(lk->o_proj);
     ane_free(lk->fused_ffn);
     ane_free(lk->fused_oproj_norm);
+    ane_free(lk->fused_oproj_ffn);
     ane_free_chunked_ffn(&lk->chunked_ffn);
-    lk->first_proj = lk->o_proj = lk->fused_ffn = lk->fused_oproj_norm = nullptr;
+    lk->first_proj = lk->o_proj = lk->fused_ffn = lk->fused_oproj_norm = lk->fused_oproj_ffn = nullptr;
 }
 
 // ============ High-level compile functions ============
@@ -1028,6 +1029,235 @@ bool ane_eval_fused_oproj_norm(ANEKernel* k, float* x_norm, float* x_updated,
     int in_chs[2] = { in_dim, out_dim };
     float* outs[2] = { x_norm, x_updated };
     int out_chs[2] = { out_dim, out_dim };
+    return ane_eval_multi(k, ins, in_chs, outs, out_chs);
+}
+
+// ============ Fused O_proj + add + RMSNorm + SwiGLU FFN ============
+// The mega-kernel: 2 runtime inputs, 4 const convs, RMSNorm, SiLU
+// This replaces 2 ANE dispatches (oproj_norm + FFN) with 1
+
+static id mil_gen_fused_oproj_ffn(int dim, int in_dim, int inter_ch) {
+    std::string s;
+    char buf[1024];
+    s += MIL_HEADER;
+
+    // 2 runtime inputs
+    snprintf(buf, sizeof(buf),
+        "    func main<ios16>(tensor<fp16, [1, %d, 1, %d]> attn,"
+        " tensor<fp16, [1, %d, 1, %d]> xres) {\n", in_dim, SP, dim, SP);
+    s += buf;
+
+    // Conv shared params
+    s += "        tensor<string, []> pt = const()[name = tensor<string, []>(\"pt\"), val = tensor<string, []>(\"valid\")];\n"
+         "        tensor<int32, [2]> st = const()[name = tensor<string, []>(\"st\"), val = tensor<int32, [2]>([1, 1])];\n"
+         "        tensor<int32, [4]> pd = const()[name = tensor<string, []>(\"pd\"), val = tensor<int32, [4]>([0, 0, 0, 0])];\n"
+         "        tensor<int32, [2]> dl = const()[name = tensor<string, []>(\"dl\"), val = tensor<int32, [2]>([1, 1])];\n"
+         "        tensor<int32, []> gr = const()[name = tensor<string, []>(\"gr\"), val = tensor<int32, []>(1)];\n";
+
+    // --- O_proj conv ---
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [%d, %d, 1, 1]> Wo = const()[name = tensor<string, []>(\"Wo\"), "
+        "val = tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE(path = tensor<string, []>"
+        "(\"@model_path/weights/oproj.bin\"), offset = tensor<uint64, []>(64)))];\n",
+        dim, in_dim, dim, in_dim);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> oproj = conv(dilations = dl, groups = gr, "
+        "pad = pd, pad_type = pt, strides = st, weight = Wo, x = attn)"
+        "[name = tensor<string, []>(\"op\")];\n", dim, SP);
+    s += buf;
+
+    // --- Residual add ---
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> x = add(x = xres, y = oproj)"
+        "[name = tensor<string, []>(\"ad\")];\n", dim, SP);
+    s += buf;
+
+    // --- RMSNorm (pre-scaled for fp16 safety) ---
+    // RMSNorm is scale-invariant: RMSNorm(αx) = RMSNorm(x)
+    // Pre-scale by 1/8 so sum(x²)/64 stays within fp16 range (max 65504)
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, 1, 1, %d]> rsk = const()[name = tensor<string, []>(\"rsk\"), "
+        "val = tensor<fp16, [1, 1, 1, %d]>(BLOBFILE(path = tensor<string, []>"
+        "(\"@model_path/weights/rms_scale.bin\"), offset = tensor<uint64, []>(64)))];\n", SP, SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> xsc = mul(x = x, y = rsk)"
+        "[name = tensor<string, []>(\"xsc\")];\n", dim, SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> sq = mul(x = xsc, y = xsc)"
+        "[name = tensor<string, []>(\"sq\")];\n", dim, SP);
+    s += buf;
+    s += "        tensor<int32, [1]> axes = const()[name = tensor<string, []>(\"ax\"), val = tensor<int32, [1]>([1])];\n"
+         "        tensor<bool, []> kd = const()[name = tensor<string, []>(\"kd\"), val = tensor<bool, []>(true)];\n";
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, 1, 1, %d]> ss = reduce_sum(x = sq, axes = axes, keep_dims = kd)"
+        "[name = tensor<string, []>(\"rs\")];\n", SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, 1, 1, %d]> di = const()[name = tensor<string, []>(\"di\"), "
+        "val = tensor<fp16, [1, 1, 1, %d]>(BLOBFILE(path = tensor<string, []>"
+        "(\"@model_path/weights/dim_inv.bin\"), offset = tensor<uint64, []>(64)))];\n", SP, SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, 1, 1, %d]> ms = mul(x = ss, y = di)"
+        "[name = tensor<string, []>(\"ms\")];\n", SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, 1, 1, %d]> ep = const()[name = tensor<string, []>(\"ep\"), "
+        "val = tensor<fp16, [1, 1, 1, %d]>(BLOBFILE(path = tensor<string, []>"
+        "(\"@model_path/weights/eps.bin\"), offset = tensor<uint64, []>(64)))];\n", SP, SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, 1, 1, %d]> ae = add(x = ms, y = ep)"
+        "[name = tensor<string, []>(\"ae\")];\n", SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, 1, 1, %d]> sr = sqrt(x = ae)"
+        "[name = tensor<string, []>(\"sr\")];\n", SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, 1, 1, %d]> on = const()[name = tensor<string, []>(\"on\"), "
+        "val = tensor<fp16, [1, 1, 1, %d]>(BLOBFILE(path = tensor<string, []>"
+        "(\"@model_path/weights/ones.bin\"), offset = tensor<uint64, []>(64)))];\n", SP, SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, 1, 1, %d]> sc = real_div(x = on, y = sr)"
+        "[name = tensor<string, []>(\"is\")];\n", SP);
+    s += buf;
+    // Apply inv_rms to SCALED x (not original) — scale cancels: (x/k)*(k/rms(x)) = x/rms(x)
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> xs = mul(x = xsc, y = sc)"
+        "[name = tensor<string, []>(\"xs\")];\n", dim, SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> wn = const()[name = tensor<string, []>(\"wn\"), "
+        "val = tensor<fp16, [1, %d, 1, %d]>(BLOBFILE(path = tensor<string, []>"
+        "(\"@model_path/weights/nw.bin\"), offset = tensor<uint64, []>(64)))];\n",
+        dim, SP, dim, SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> normed = mul(x = xs, y = wn)"
+        "[name = tensor<string, []>(\"nm\")];\n", dim, SP);
+    s += buf;
+
+    // --- SwiGLU FFN: gate, up, silu, mul, down ---
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [%d, %d, 1, 1]> Wg = const()[name = tensor<string, []>(\"Wg\"), "
+        "val = tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE(path = tensor<string, []>"
+        "(\"@model_path/weights/wg.bin\"), offset = tensor<uint64, []>(64)))];\n",
+        inter_ch, dim, inter_ch, dim);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [%d, %d, 1, 1]> Wu = const()[name = tensor<string, []>(\"Wu\"), "
+        "val = tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE(path = tensor<string, []>"
+        "(\"@model_path/weights/wu.bin\"), offset = tensor<uint64, []>(64)))];\n",
+        inter_ch, dim, inter_ch, dim);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [%d, %d, 1, 1]> Wd = const()[name = tensor<string, []>(\"Wd\"), "
+        "val = tensor<fp16, [%d, %d, 1, 1]>(BLOBFILE(path = tensor<string, []>"
+        "(\"@model_path/weights/wd.bin\"), offset = tensor<uint64, []>(64)))];\n",
+        dim, inter_ch, dim, inter_ch);
+    s += buf;
+
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> gate = conv(dilations = dl, groups = gr, pad = pd, "
+        "pad_type = pt, strides = st, weight = Wg, x = normed)"
+        "[name = tensor<string, []>(\"cg\")];\n", inter_ch, SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> up = conv(dilations = dl, groups = gr, pad = pd, "
+        "pad_type = pt, strides = st, weight = Wu, x = normed)"
+        "[name = tensor<string, []>(\"cu\")];\n", inter_ch, SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> sig = sigmoid(x = gate)"
+        "[name = tensor<string, []>(\"sg\")];\n", inter_ch, SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> silu = mul(x = gate, y = sig)"
+        "[name = tensor<string, []>(\"sl\")];\n", inter_ch, SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> fused = mul(x = silu, y = up)"
+        "[name = tensor<string, []>(\"fu\")];\n", inter_ch, SP);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+        "        tensor<fp16, [1, %d, 1, %d]> ffn = conv(dilations = dl, groups = gr, pad = pd, "
+        "pad_type = pt, strides = st, weight = Wd, x = fused)"
+        "[name = tensor<string, []>(\"cd\")];\n", dim, SP);
+    s += buf;
+
+    // 2 outputs: ffn_out (for residual add) and x (updated residual before norm)
+    s += "    } -> (ffn, x);\n}\n";
+    return ns_data(s.c_str(), s.size());
+}
+
+ANEKernel* ane_compile_fused_oproj_ffn(const uint16_t* oproj_bf16,
+                                        const uint16_t* gate_bf16,
+                                        const uint16_t* up_bf16,
+                                        const uint16_t* down_bf16,
+                                        const float* norm_weight,
+                                        int dim, int in_dim, int inter_ch, float eps) {
+    void* pool = objc_autoreleasePoolPush();
+
+    id w_oproj = build_weight_blob(oproj_bf16, dim * in_dim);
+    id w_nw = build_norm_weight_blob(norm_weight, dim);
+    id w_di = build_scalar_blob(1.0f / dim);
+    id w_ep = build_scalar_blob(eps);
+    id w_on = build_scalar_blob(1.0f);
+    id w_rsk = build_scalar_blob(1.0f / 8.0f);  // pre-scale for fp16 RMSNorm safety
+    id w_gate = build_weight_blob(gate_bf16, inter_ch * dim);
+    id w_up = build_weight_blob(up_bf16, inter_ch * dim);
+    id w_down = build_weight_blob(down_bf16, dim * inter_ch);
+
+    id keys[] = {
+        ns_str("@model_path/weights/oproj.bin"),
+        ns_str("@model_path/weights/nw.bin"),
+        ns_str("@model_path/weights/dim_inv.bin"),
+        ns_str("@model_path/weights/eps.bin"),
+        ns_str("@model_path/weights/ones.bin"),
+        ns_str("@model_path/weights/rms_scale.bin"),
+        ns_str("@model_path/weights/wg.bin"),
+        ns_str("@model_path/weights/wu.bin"),
+        ns_str("@model_path/weights/wd.bin"),
+    };
+    id values[] = {
+        ns_weight_entry(w_oproj),
+        ns_weight_entry(w_nw),
+        ns_weight_entry(w_di),
+        ns_weight_entry(w_ep),
+        ns_weight_entry(w_on),
+        ns_weight_entry(w_rsk),
+        ns_weight_entry(w_gate),
+        ns_weight_entry(w_up),
+        ns_weight_entry(w_down),
+    };
+    id wdict = ns_dict(keys, values, 9);
+
+    id mil = mil_gen_fused_oproj_ffn(dim, in_dim, inter_ch);
+    size_t in_sizes[2] = {
+        (size_t)in_dim * SP * sizeof(uint16_t),
+        (size_t)dim * SP * sizeof(uint16_t),
+    };
+    size_t out_sizes[2] = {
+        (size_t)dim * SP * sizeof(uint16_t),
+        (size_t)dim * SP * sizeof(uint16_t),
+    };
+    ANEKernel* r = ane_compile_raw(mil, wdict, 2, in_sizes, 2, out_sizes);
+    objc_autoreleasePoolPop(pool);
+    return r;
+}
+
+bool ane_eval_fused_oproj_ffn(ANEKernel* k, float* ffn_out, float* x_updated,
+                               const float* attn_out, const float* x_residual,
+                               int in_dim, int dim) {
+    float* ins[2] = { (float*)attn_out, (float*)x_residual };
+    int in_chs[2] = { in_dim, dim };
+    float* outs[2] = { ffn_out, x_updated };
+    int out_chs[2] = { dim, dim };
     return ane_eval_multi(k, ins, in_chs, outs, out_chs);
 }
 
@@ -1422,6 +1652,37 @@ ANEKernel* ane_compile_mil_weighted(const char* mil_text,
     return k;
 }
 
+// ============ Generic MIL compile with raw weight blobs ============
+
+ANEKernel* ane_compile_mil_raw(const char* mil_text,
+                                int n_inputs, size_t* input_sizes,
+                                int n_outputs, size_t* output_sizes,
+                                MILRawWeight* weights, int n_weights) {
+    if (!ane_available()) return nullptr;
+    void* pool = objc_autoreleasePoolPush();
+    id mil = ns_data(mil_text, strlen(mil_text));
+
+    // Build weight dict from raw blob data (no bf16→fp16 conversion)
+    id wdict = (id)nullptr;
+    if (n_weights > 0) {
+        id* keys = (id*)alloca(n_weights * sizeof(id));
+        id* values = (id*)alloca(n_weights * sizeof(id));
+        for (int i = 0; i < n_weights; i++) {
+            char kbuf[128];
+            snprintf(kbuf, sizeof(kbuf), "@model_path/weights/%s.bin", weights[i].name);
+            keys[i] = ns_str(kbuf);
+            // Wrap raw blob bytes in NSData — written verbatim to disk by ane_compile_raw
+            id blob = ns_data(weights[i].data, (unsigned long)weights[i].size);
+            values[i] = ns_weight_entry(blob);
+        }
+        wdict = ns_dict(keys, values, (unsigned long)n_weights);
+    }
+
+    ANEKernel* k = ane_compile_raw(mil, wdict, n_inputs, input_sizes, n_outputs, output_sizes);
+    objc_autoreleasePoolPop(pool);
+    return k;
+}
+
 // ============ Dynamic-weight conv ============
 // MIL program with TWO inputs: x and W (weights passed at runtime, not baked in)
 // Uses conv() op — ANE accepts non-constant weight inputs for conv!
@@ -1791,6 +2052,127 @@ bool ane_write_input_tiled(ANEKernel* k, int input_idx, const float* data,
                 }
     IOSurfaceUnlock(surf, 0, NULL);
     return true;
+}
+
+// ============ API Tuning ============
+
+void* ane_get_model(ANEKernel* k) { return k ? (void*)k->model : nullptr; }
+void* ane_get_request(ANEKernel* k) { return k ? (void*)k->request : nullptr; }
+
+bool ane_eval_qos(ANEKernel* k, int qos) {
+    if (!k) return false;
+    SEL eval_sel = sel("evaluateWithQoS:options:request:error:");
+    id e = nullptr;
+    bool ok = ((bool(*)(id,SEL,unsigned int,id,id,id*))objc_msgSend)(
+        k->model, eval_sel, (unsigned int)qos, ns_empty_dict(), k->request, &e);
+    if (!ok) {
+        fprintf(stderr, "ANE eval failed (qos=%d): %s\n", qos,
+            e ? to_cstr(((id(*)(id,SEL))objc_msgSend)(e, sel("description"))) : "unknown");
+    }
+    return ok;
+}
+
+void ane_print_model_info(ANEKernel* k) {
+    if (!k) return;
+    id model = k->model;
+
+    // State
+    int state = ((int(*)(id,SEL))objc_msgSend)(model, sel("state"));
+    fprintf(stderr, "  state: %d\n", state);
+
+    // Queue depth
+    int qd = ((int(*)(id,SEL))objc_msgSend)(model, sel("queueDepth"));
+    fprintf(stderr, "  queueDepth: %d\n", qd);
+
+    // PerfStatsMask
+    unsigned int mask = ((unsigned int(*)(id,SEL))objc_msgSend)(model, sel("perfStatsMask"));
+    fprintf(stderr, "  perfStatsMask: 0x%08X\n", mask);
+
+    // Model attributes
+    id attrs = ((id(*)(id,SEL))objc_msgSend)(model, sel("modelAttributes"));
+    if (attrs) {
+        const char* desc = to_cstr(((id(*)(id,SEL))objc_msgSend)(attrs, sel("description")));
+        fprintf(stderr, "  modelAttributes: %s\n", desc);
+    } else {
+        fprintf(stderr, "  modelAttributes: nil\n");
+    }
+
+    // hexStringIdentifier
+    id hex = ((id(*)(id,SEL))objc_msgSend)(model, sel("hexStringIdentifier"));
+    if (hex) {
+        fprintf(stderr, "  hexStringIdentifier: %s\n", to_cstr(hex));
+    }
+
+    // isMILModel
+    bool isMIL = ((bool(*)(id,SEL))objc_msgSend)(model, sel("isMILModel"));
+    fprintf(stderr, "  isMILModel: %s\n", isMIL ? "yes" : "no");
+
+    // programHandle (skip description — it can crash on some types)
+    id ph = ((id(*)(id,SEL))objc_msgSend)(model, sel("programHandle"));
+    fprintf(stderr, "  programHandle: %s\n", ph ? "present" : "nil");
+
+    // Request info
+    id req = k->request;
+    id perfStats = ((id(*)(id,SEL))objc_msgSend)(req, sel("perfStats"));
+    fprintf(stderr, "  request.perfStats: %s\n", perfStats ? "present" : "nil");
+
+    id perfArr = ((id(*)(id,SEL))objc_msgSend)(req, sel("perfStatsArray"));
+    if (perfArr) {
+        unsigned long count = ((unsigned long(*)(id,SEL))objc_msgSend)(perfArr, sel("count"));
+        fprintf(stderr, "  request.perfStatsArray: %lu entries\n", count);
+    } else {
+        fprintf(stderr, "  request.perfStatsArray: nil\n");
+    }
+
+    // Shared connection info
+    id client = ((id(*)(Class,SEL))objc_msgSend)(cls("_ANEClient"), sel("sharedConnection"));
+    if (client) {
+        fprintf(stderr, "  _ANEClient: connected\n");
+        // Check for real-time support
+        SEL rt_eval = sel("evaluateRealTimeWithModel:options:request:error:");
+        bool has_rt = class_getInstanceMethod(object_getClass(client), rt_eval) != nullptr;
+        fprintf(stderr, "  hasRealTimeEval: %s\n", has_rt ? "yes" : "no");
+
+        SEL begin_rt = sel("beginRealTimeTask");
+        bool has_begin_rt = class_getInstanceMethod(object_getClass(client), begin_rt) != nullptr;
+        fprintf(stderr, "  hasBeginRealTimeTask: %s\n", has_begin_rt ? "yes" : "no");
+
+        // Check for chaining
+        SEL chain = sel("prepareChainingWithModel:options:chainingReq:qos:error:");
+        bool has_chain = class_getInstanceMethod(object_getClass(client), chain) != nullptr;
+        fprintf(stderr, "  hasChaining: %s\n", has_chain ? "yes" : "no");
+
+        // Check for direct eval
+        SEL direct = sel("doEvaluateDirectWithModel:options:request:qos:error:");
+        bool has_direct = class_getInstanceMethod(object_getClass(client), direct) != nullptr;
+        fprintf(stderr, "  hasDirectEval: %s\n", has_direct ? "yes" : "no");
+
+        // Check for buffersReady
+        SEL bufReady = sel("buffersReadyWithModel:inputBuffers:options:qos:error:");
+        bool has_bufReady = class_getInstanceMethod(object_getClass(client), bufReady) != nullptr;
+        fprintf(stderr, "  hasBuffersReady: %s\n", has_bufReady ? "yes" : "no");
+
+        // Check for enqueueSets
+        SEL enqueue = sel("enqueueSetsWithModel:outputSet:options:qos:error:");
+        bool has_enqueue = class_getInstanceMethod(object_getClass(client), enqueue) != nullptr;
+        fprintf(stderr, "  hasEnqueueSets: %s\n", has_enqueue ? "yes" : "no");
+    }
+
+    fprintf(stderr, "  nInputs: %d, nOutputs: %d\n", k->nInputs, k->nOutputs);
+    for (int i = 0; i < k->nInputs; i++)
+        fprintf(stderr, "  input[%d]: %zu bytes\n", i, k->inputBytes[i]);
+    for (int i = 0; i < k->nOutputs; i++)
+        fprintf(stderr, "  output[%d]: %zu bytes\n", i, k->outputBytes[i]);
+}
+
+void ane_set_queue_depth(ANEKernel* k, int depth) {
+    if (!k) return;
+    ((void(*)(id,SEL,int))objc_msgSend)(k->model, sel("setQueueDepth:"), depth);
+}
+
+void ane_set_perf_stats_mask(ANEKernel* k, unsigned int mask) {
+    if (!k) return;
+    ((void(*)(id,SEL,unsigned int))objc_msgSend)(k->model, sel("setPerfStatsMask:"), mask);
 }
 
 } // namespace ane_lm

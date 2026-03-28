@@ -27,6 +27,7 @@ struct LayerANEKernels {
     ANEKernel* fused_ffn = nullptr;
     ChunkedFFN chunked_ffn = {};
     ANEKernel* fused_oproj_norm = nullptr;  // conv(O_proj) → add(res) → RMSNorm [2 outputs: x_norm, x_updated]
+    ANEKernel* fused_oproj_ffn = nullptr;   // conv(O_proj) → add(res) → RMSNorm → SwiGLU FFN [2 outputs: ffn_out, x_updated]
 };
 
 // Global state
@@ -81,6 +82,20 @@ bool ane_eval_fused_oproj_norm(ANEKernel* k, float* x_norm, float* x_updated,
                                 const float* attn_out, const float* x_residual,
                                 int in_dim, int out_dim);
 
+// Fused O_proj + residual add + RMSNorm + SwiGLU FFN kernel
+// 2 inputs: attn_out [in_dim], x_residual [out_dim]
+// 2 outputs: ffn_out [out_dim], x_updated [out_dim]
+ANEKernel* ane_compile_fused_oproj_ffn(const uint16_t* oproj_bf16,
+                                        const uint16_t* gate_bf16,
+                                        const uint16_t* up_bf16,
+                                        const uint16_t* down_bf16,
+                                        const float* norm_weight,
+                                        int dim, int in_dim, int inter_ch, float eps);
+
+bool ane_eval_fused_oproj_ffn(ANEKernel* k, float* ffn_out, float* x_updated,
+                               const float* attn_out, const float* x_residual,
+                               int in_dim, int dim);
+
 // Kernel execution
 bool ane_matvec(ANEKernel* k, float* output, const float* input, int in_dim, int out_dim);
 bool ane_eval_chunked_ffn(const ChunkedFFN* cffn, float* output, const float* input);
@@ -110,6 +125,19 @@ ANEKernel* ane_compile_mil_weighted(const char* mil_text,
                                      int n_inputs, size_t* input_sizes,
                                      int n_outputs, size_t* output_sizes,
                                      MILWeight* weights, int n_weights);
+
+// Generic MIL compile with raw weight blobs (no BF16→FP16 conversion)
+// Each weight entry is raw blob bytes written verbatim to disk.
+// Use this for INT8 quantized weights, custom formats, etc.
+struct MILRawWeight {
+    const char* name;         // e.g. "wq" → @model_path/weights/wq.bin
+    const void* data;         // Raw blob data (header + payload)
+    size_t size;              // Total blob size in bytes
+};
+ANEKernel* ane_compile_mil_raw(const char* mil_text,
+                                int n_inputs, size_t* input_sizes,
+                                int n_outputs, size_t* output_sizes,
+                                MILRawWeight* weights, int n_weights);
 
 // Dynamic-weight conv
 ANEKernel* ane_compile_dynamic_conv(int out_dim, int in_dim);
@@ -150,5 +178,23 @@ bool ane_read_output_raw(ANEKernel* k, int output_idx, float* data, int count);
 // Write float data into input surface with tiled [N,C,H,W] layout
 bool ane_write_input_tiled(ANEKernel* k, int input_idx, const float* data,
                            int N, int C, int H, int W);
+
+// ============ API Tuning ============
+
+// Access internal ObjC objects (for direct API exploration)
+void* ane_get_model(ANEKernel* k);    // Returns id (_ANEInMemoryModel*)
+void* ane_get_request(ANEKernel* k);  // Returns id (_ANERequest*)
+
+// Evaluate with a specific QoS level (default is 21 = userInteractive)
+bool ane_eval_qos(ANEKernel* k, int qos);
+
+// Print model info: queueDepth, state, perfStatsMask, attributes
+void ane_print_model_info(ANEKernel* k);
+
+// Set queue depth on the model (for pipelining)
+void ane_set_queue_depth(ANEKernel* k, int depth);
+
+// Enable perf stats collection (mask=0xFFFFFFFF for all)
+void ane_set_perf_stats_mask(ANEKernel* k, unsigned int mask);
 
 } // namespace ane_lm
