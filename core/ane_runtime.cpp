@@ -733,59 +733,163 @@ typedef __fp16 ane_fp16_t;
 #define ANE_USE_NATIVE_FP16 0
 #endif
 
-// Skip IOSurface lock/unlock on hot path — ANE hardware manages coherency via eval.
-// The lock/unlock is only needed for initial setup; once surfaces are allocated and
-// base addresses cached, direct memory access works.
-// Set ANE_SKIP_LOCKS=1 to enable.
-static bool g_skip_locks = false;
-static bool g_skip_locks_checked = false;
+// Skip IOSurface lock/unlock on hot path — synchronous ANE eval appears to provide
+// the required coherency, and the lock/unlock syscalls cost several ms/token in real decode.
+// Default is skip-locks ON; set ANE_USE_LOCKS=1 to force the conservative path.
+// PROFILE_ANE=1 prints a hot-path timing breakdown at process exit.
+static bool g_skip_locks = true;
+static bool g_hotpath_config_checked = false;
+
+struct ANEProfileBucket {
+    double lock_ms = 0;
+    double write_ms = 0;
+    double eval_ms = 0;
+    double read_ms = 0;
+    uint64_t calls = 0;
+};
+
+struct ANEProfileState {
+    bool enabled = false;
+    ANEProfileBucket matvec = {};
+    ANEProfileBucket multi = {};
+    ANEProfileBucket chunked = {};
+
+    static void print_bucket(const char* name, const ANEProfileBucket& bucket) {
+        if (!bucket.calls) return;
+        double calls = (double)bucket.calls;
+        double total_ms = bucket.lock_ms + bucket.write_ms + bucket.eval_ms + bucket.read_ms;
+        fprintf(stderr,
+                "  %-7s %6llu calls  avg %7.2f us  [lock %6.2f | write %6.2f | eval %6.2f | read %6.2f] us\n",
+                name,
+                (unsigned long long)bucket.calls,
+                total_ms * 1000.0 / calls,
+                bucket.lock_ms * 1000.0 / calls,
+                bucket.write_ms * 1000.0 / calls,
+                bucket.eval_ms * 1000.0 / calls,
+                bucket.read_ms * 1000.0 / calls);
+    }
+
+    ~ANEProfileState() {
+        if (!enabled) return;
+        double total_lock_ms = matvec.lock_ms + multi.lock_ms + chunked.lock_ms;
+        double total_write_ms = matvec.write_ms + multi.write_ms + chunked.write_ms;
+        double total_eval_ms = matvec.eval_ms + multi.eval_ms + chunked.eval_ms;
+        double total_read_ms = matvec.read_ms + multi.read_ms + chunked.read_ms;
+        double total_ms = total_lock_ms + total_write_ms + total_eval_ms + total_read_ms;
+        uint64_t total_calls = matvec.calls + multi.calls + chunked.calls;
+
+        fprintf(stderr, "\n=== ANE runtime hot-path profile ===\n");
+        fprintf(stderr, "  skip_locks: %s\n", g_skip_locks ? "YES" : "NO");
+        print_bucket("matvec", matvec);
+        print_bucket("multi", multi);
+        print_bucket("chunked", chunked);
+        if (total_calls) {
+            fprintf(stderr,
+                    "  TOTAL   %6llu calls  avg %7.2f us  [lock %6.2f | write %6.2f | eval %6.2f | read %6.2f] us\n",
+                    (unsigned long long)total_calls,
+                    total_ms * 1000.0 / (double)total_calls,
+                    total_lock_ms * 1000.0 / (double)total_calls,
+                    total_write_ms * 1000.0 / (double)total_calls,
+                    total_eval_ms * 1000.0 / (double)total_calls,
+                    total_read_ms * 1000.0 / (double)total_calls);
+        }
+        fprintf(stderr, "====================================\n");
+    }
+};
+
+static ANEProfileState g_ane_profile;
+
+static void ane_init_hotpath_config() {
+    if (__builtin_expect(!g_hotpath_config_checked, 0)) {
+        g_skip_locks = getenv("ANE_USE_LOCKS") == nullptr;
+        if (getenv("ANE_SKIP_LOCKS") != nullptr) g_skip_locks = true;
+        g_ane_profile.enabled = getenv("PROFILE_ANE") != nullptr;
+        g_hotpath_config_checked = true;
+    }
+}
+
+static inline void ane_profile_add(ANEProfileBucket* bucket,
+                                   double lock_ms,
+                                   double write_ms,
+                                   double eval_ms,
+                                   double read_ms) {
+    if (!g_ane_profile.enabled) return;
+    bucket->calls++;
+    bucket->lock_ms += lock_ms;
+    bucket->write_ms += write_ms;
+    bucket->eval_ms += eval_ms;
+    bucket->read_ms += read_ms;
+}
 
 bool ane_matvec(ANEKernel* k, float* output, const float* input, int in_dim, int out_dim) {
-    if (__builtin_expect(!g_skip_locks_checked, 0)) {
-        g_skip_locks = getenv("ANE_SKIP_LOCKS") != nullptr;
-        g_skip_locks_checked = true;
-    }
+    ane_init_hotpath_config();
+    double lock_ms = 0.0, write_ms = 0.0, eval_ms = 0.0, read_ms = 0.0;
 
     IOSurfaceRef in_surface = k->ioInputs[0];
     if (!g_skip_locks) {
+        Timer t;
         if (IOSurfaceLock(in_surface, 0, NULL) != kIOReturnSuccess) {
             fprintf(stderr, "ANE: IOSurfaceLock(input) failed\n");
             return false;
         }
+        lock_ms += t.elapsed_ms();
     }
     uint16_t* in_base = (uint16_t*)IOSurfaceGetBaseAddress(in_surface);
+    {
+        Timer t;
 #if ANE_USE_NATIVE_FP16
-    ane_fp16_t* in_base_h = (ane_fp16_t*)in_base;
+        ane_fp16_t* in_base_h = (ane_fp16_t*)in_base;
 #pragma clang loop vectorize(enable)
-    for (int c = 0, idx = 0; c < in_dim; c++, idx += ANE_SPATIAL)
-        in_base_h[idx] = (ane_fp16_t)input[c];
+        for (int c = 0, idx = 0; c < in_dim; c++, idx += ANE_SPATIAL)
+            in_base_h[idx] = (ane_fp16_t)input[c];
 #else
-    for (int c = 0, idx = 0; c < in_dim; c++, idx += ANE_SPATIAL)
-        in_base[idx] = f32_to_f16(input[c]);
+        for (int c = 0, idx = 0; c < in_dim; c++, idx += ANE_SPATIAL)
+            in_base[idx] = f32_to_f16(input[c]);
 #endif
-    if (!g_skip_locks) IOSurfaceUnlock(in_surface, 0, NULL);
+        write_ms += t.elapsed_ms();
+    }
+    if (!g_skip_locks) {
+        Timer t;
+        IOSurfaceUnlock(in_surface, 0, NULL);
+        lock_ms += t.elapsed_ms();
+    }
 
-    if (!ane_eval_raw(k)) return false;
+    {
+        Timer t;
+        if (!ane_eval_raw(k)) return false;
+        eval_ms += t.elapsed_ms();
+    }
 
     IOSurfaceRef out_surface = k->ioOutputs[0];
     if (!g_skip_locks) {
+        Timer t;
         if (IOSurfaceLock(out_surface, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) {
             fprintf(stderr, "ANE: IOSurfaceLock(output) failed\n");
             return false;
         }
+        lock_ms += t.elapsed_ms();
     }
     const uint16_t* out_base = (const uint16_t*)IOSurfaceGetBaseAddress(out_surface);
+    {
+        Timer t;
 #if ANE_USE_NATIVE_FP16
-    const ane_fp16_t* out_base_h = (const ane_fp16_t*)out_base;
+        const ane_fp16_t* out_base_h = (const ane_fp16_t*)out_base;
 #pragma clang loop vectorize(enable)
-    for (int c = 0, idx = 0; c < out_dim; c++, idx += ANE_SPATIAL)
-        output[c] = (float)out_base_h[idx];
+        for (int c = 0, idx = 0; c < out_dim; c++, idx += ANE_SPATIAL)
+            output[c] = (float)out_base_h[idx];
 #else
-    for (int c = 0, idx = 0; c < out_dim; c++, idx += ANE_SPATIAL)
-        output[c] = f16_to_f32(out_base[idx]);
+        for (int c = 0, idx = 0; c < out_dim; c++, idx += ANE_SPATIAL)
+            output[c] = f16_to_f32(out_base[idx]);
 #endif
-    if (!g_skip_locks) IOSurfaceUnlock(out_surface, kIOSurfaceLockReadOnly, NULL);
+        read_ms += t.elapsed_ms();
+    }
+    if (!g_skip_locks) {
+        Timer t;
+        IOSurfaceUnlock(out_surface, kIOSurfaceLockReadOnly, NULL);
+        lock_ms += t.elapsed_ms();
+    }
 
+    ane_profile_add(&g_ane_profile.matvec, lock_ms, write_ms, eval_ms, read_ms);
     return true;
 }
 
@@ -2003,87 +2107,125 @@ bool ane_compile_chunked_ffn_blob(ChunkedFFN* out, const std::string& gate_path,
 
 // Eval: chain through all chunks. Host packs [x | acc] between dispatches.
 bool ane_eval_chunked_ffn(const ChunkedFFN* cffn, float* output, const float* input) {
+    ane_init_hotpath_config();
     int dim = cffn->dim;
     int packed_ch = 2 * dim;
+    (void)packed_ch;
+    double lock_ms = 0.0, write_ms = 0.0, eval_ms = 0.0, read_ms = 0.0;
 
     for (int c = 0; c < cffn->num_chunks; c++) {
         ANEKernel* k = cffn->chunks[c];
         IOSurfaceRef in_surface = k->ioInputs[0];
 
         // Lock and write packed input: [x | acc]
-        if (IOSurfaceLock(in_surface, 0, NULL) != kIOReturnSuccess) return false;
+        if (!g_skip_locks) {
+            Timer t;
+            if (IOSurfaceLock(in_surface, 0, NULL) != kIOReturnSuccess) return false;
+            lock_ms += t.elapsed_ms();
+        }
 #if ANE_USE_NATIVE_FP16
         ane_fp16_t* in_base = (ane_fp16_t*)IOSurfaceGetBaseAddress(in_surface);
 #else
         uint16_t* in_base = (uint16_t*)IOSurfaceGetBaseAddress(in_surface);
 #endif
 
-        // Write x into first dim channels
-#pragma clang loop vectorize(enable)
-        for (int i = 0, idx = 0; i < dim; i++, idx += ANE_SPATIAL) {
-#if ANE_USE_NATIVE_FP16
-            in_base[idx] = (ane_fp16_t)input[i];
-#else
-            in_base[idx] = f32_to_f16(input[i]);
-#endif
-        }
-
-        // Write accumulator into next dim channels
-        if (c == 0) {
-            // First chunk: acc = zeros
-            for (int i = 0, idx = dim * ANE_SPATIAL; i < dim; i++, idx += ANE_SPATIAL) {
-#if ANE_USE_NATIVE_FP16
-                in_base[idx] = (ane_fp16_t)0.0f;
-#else
-                in_base[idx] = 0;
-#endif
-            }
-        } else {
-            // Subsequent chunks: acc = previous output (already in output buffer)
-            // Read from previous chunk's output surface and write to this chunk's input
-            IOSurfaceRef prev_out = cffn->chunks[c - 1]->ioOutputs[0];
-            if (IOSurfaceLock(prev_out, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) {
-                IOSurfaceUnlock(in_surface, 0, NULL);
-                return false;
-            }
-#if ANE_USE_NATIVE_FP16
-            const ane_fp16_t* prev_base = (const ane_fp16_t*)IOSurfaceGetBaseAddress(prev_out);
-#else
-            const uint16_t* prev_base = (const uint16_t*)IOSurfaceGetBaseAddress(prev_out);
-#endif
-            // Copy prev output (dim channels) into acc portion of packed input
-            size_t acc_offset = (size_t)dim * ANE_SPATIAL;
+        {
+            Timer t;
+            // Write x into first dim channels
 #pragma clang loop vectorize(enable)
             for (int i = 0, idx = 0; i < dim; i++, idx += ANE_SPATIAL) {
-                in_base[acc_offset + idx] = prev_base[idx];
+#if ANE_USE_NATIVE_FP16
+                in_base[idx] = (ane_fp16_t)input[i];
+#else
+                in_base[idx] = f32_to_f16(input[i]);
+#endif
             }
-            IOSurfaceUnlock(prev_out, kIOSurfaceLockReadOnly, NULL);
+
+            // Write accumulator into next dim channels
+            if (c == 0) {
+                // First chunk: acc = zeros
+                for (int i = 0, idx = dim * ANE_SPATIAL; i < dim; i++, idx += ANE_SPATIAL) {
+#if ANE_USE_NATIVE_FP16
+                    in_base[idx] = (ane_fp16_t)0.0f;
+#else
+                    in_base[idx] = 0;
+#endif
+                }
+            } else {
+                // Subsequent chunks: acc = previous output (already in output buffer)
+                // Read from previous chunk's output surface and write to this chunk's input
+                IOSurfaceRef prev_out = cffn->chunks[c - 1]->ioOutputs[0];
+                if (!g_skip_locks) {
+                    Timer t_lock;
+                    if (IOSurfaceLock(prev_out, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) {
+                        IOSurfaceUnlock(in_surface, 0, NULL);
+                        return false;
+                    }
+                    lock_ms += t_lock.elapsed_ms();
+                }
+#if ANE_USE_NATIVE_FP16
+                const ane_fp16_t* prev_base = (const ane_fp16_t*)IOSurfaceGetBaseAddress(prev_out);
+#else
+                const uint16_t* prev_base = (const uint16_t*)IOSurfaceGetBaseAddress(prev_out);
+#endif
+                size_t acc_offset = (size_t)dim * ANE_SPATIAL;
+#pragma clang loop vectorize(enable)
+                for (int i = 0, idx = 0; i < dim; i++, idx += ANE_SPATIAL) {
+                    in_base[acc_offset + idx] = prev_base[idx];
+                }
+                if (!g_skip_locks) {
+                    Timer t_lock;
+                    IOSurfaceUnlock(prev_out, kIOSurfaceLockReadOnly, NULL);
+                    lock_ms += t_lock.elapsed_ms();
+                }
+            }
+            write_ms += t.elapsed_ms();
         }
 
-        IOSurfaceUnlock(in_surface, 0, NULL);
+        if (!g_skip_locks) {
+            Timer t;
+            IOSurfaceUnlock(in_surface, 0, NULL);
+            lock_ms += t.elapsed_ms();
+        }
 
-        // Dispatch on ANE
-        if (!ane_eval_raw(k)) return false;
+        {
+            Timer t;
+            if (!ane_eval_raw(k)) return false;
+            eval_ms += t.elapsed_ms();
+        }
     }
 
     // Read final output from last chunk
     ANEKernel* last = cffn->chunks[cffn->num_chunks - 1];
     IOSurfaceRef out_surface = last->ioOutputs[0];
-    if (IOSurfaceLock(out_surface, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return false;
+    if (!g_skip_locks) {
+        Timer t;
+        if (IOSurfaceLock(out_surface, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return false;
+        lock_ms += t.elapsed_ms();
+    }
 #if ANE_USE_NATIVE_FP16
     const ane_fp16_t* out_base = (const ane_fp16_t*)IOSurfaceGetBaseAddress(out_surface);
 #else
     const uint16_t* out_base = (const uint16_t*)IOSurfaceGetBaseAddress(out_surface);
 #endif
+    {
+        Timer t;
 #pragma clang loop vectorize(enable)
-    for (int i = 0, idx = 0; i < dim; i++, idx += ANE_SPATIAL) {
+        for (int i = 0, idx = 0; i < dim; i++, idx += ANE_SPATIAL) {
 #if ANE_USE_NATIVE_FP16
-        output[i] = (float)out_base[idx];
+            output[i] = (float)out_base[idx];
 #else
-        output[i] = f16_to_f32(out_base[idx]);
+            output[i] = f16_to_f32(out_base[idx]);
 #endif
+        }
+        read_ms += t.elapsed_ms();
     }
-    IOSurfaceUnlock(out_surface, kIOSurfaceLockReadOnly, NULL);
+    if (!g_skip_locks) {
+        Timer t;
+        IOSurfaceUnlock(out_surface, kIOSurfaceLockReadOnly, NULL);
+        lock_ms += t.elapsed_ms();
+    }
+    ane_profile_add(&g_ane_profile.chunked, lock_ms, write_ms, eval_ms, read_ms);
     return true;
 }
 
@@ -2393,36 +2535,56 @@ bool ane_eval_multi(ANEKernel* k,
                     float** inputs, int* input_channels,
                     float** outputs, int* output_channels) {
     if (!k) return false;
+    ane_init_hotpath_config();
+    double lock_ms = 0.0, write_ms = 0.0, eval_ms = 0.0, read_ms = 0.0;
     
     // Write all inputs (SP-strided fp16)
     for (int i = 0; i < k->nInputs; i++) {
         IOSurfaceRef surf = k->ioInputs[i];
         if (!g_skip_locks) {
+            Timer t;
             if (IOSurfaceLock(surf, 0, NULL) != kIOReturnSuccess) return false;
+            lock_ms += t.elapsed_ms();
         }
+        int ch = input_channels[i];
 #if ANE_USE_NATIVE_FP16
         ane_fp16_t* base = (ane_fp16_t*)IOSurfaceGetBaseAddress(surf);
-        int ch = input_channels[i];
-#pragma clang loop vectorize(enable)
-        for (int c = 0, idx = 0; c < ch; c++, idx += SP)
-            base[idx] = (ane_fp16_t)inputs[i][c];
 #else
         uint16_t* base = (uint16_t*)IOSurfaceGetBaseAddress(surf);
-        int ch = input_channels[i];
-        for (int c = 0, idx = 0; c < ch; c++, idx += SP)
-            base[idx] = f32_to_f16(inputs[i][c]);
 #endif
-        if (!g_skip_locks) IOSurfaceUnlock(surf, 0, NULL);
+        {
+            Timer t;
+#if ANE_USE_NATIVE_FP16
+#pragma clang loop vectorize(enable)
+            for (int c = 0, idx = 0; c < ch; c++, idx += SP)
+                base[idx] = (ane_fp16_t)inputs[i][c];
+#else
+            for (int c = 0, idx = 0; c < ch; c++, idx += SP)
+                base[idx] = f32_to_f16(inputs[i][c]);
+#endif
+            write_ms += t.elapsed_ms();
+        }
+        if (!g_skip_locks) {
+            Timer t;
+            IOSurfaceUnlock(surf, 0, NULL);
+            lock_ms += t.elapsed_ms();
+        }
     }
     
     // Eval
-    if (!ane_eval_raw(k)) return false;
+    {
+        Timer t;
+        if (!ane_eval_raw(k)) return false;
+        eval_ms += t.elapsed_ms();
+    }
     
     // Read all outputs (SP-strided fp16)
     for (int i = 0; i < k->nOutputs; i++) {
         IOSurfaceRef surf = k->ioOutputs[i];
         if (!g_skip_locks) {
+            Timer t;
             if (IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return false;
+            lock_ms += t.elapsed_ms();
         }
 #if ANE_USE_NATIVE_FP16
         const ane_fp16_t* base = (const ane_fp16_t*)IOSurfaceGetBaseAddress(surf);
@@ -2430,15 +2592,24 @@ bool ane_eval_multi(ANEKernel* k,
         const uint16_t* base = (const uint16_t*)IOSurfaceGetBaseAddress(surf);
 #endif
         int ch = output_channels[i];
-        for (int c = 0; c < ch; c++) {
+        {
+            Timer t;
+            for (int c = 0; c < ch; c++) {
 #if ANE_USE_NATIVE_FP16
-            outputs[i][c] = (float)base[(size_t)c * SP];
+                outputs[i][c] = (float)base[(size_t)c * SP];
 #else
-            outputs[i][c] = f16_to_f32(base[(size_t)c * SP]);
+                outputs[i][c] = f16_to_f32(base[(size_t)c * SP]);
 #endif
+            }
+            read_ms += t.elapsed_ms();
         }
-        if (!g_skip_locks) IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+        if (!g_skip_locks) {
+            Timer t;
+            IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+            lock_ms += t.elapsed_ms();
+        }
     }
+    ane_profile_add(&g_ane_profile.multi, lock_ms, write_ms, eval_ms, read_ms);
     return true;
 }
 
