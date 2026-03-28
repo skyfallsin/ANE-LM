@@ -2001,23 +2001,23 @@ bool ane_eval_multi(ANEKernel* k,
     if (!k) return false;
     
     // Write all inputs (SP-strided fp16)
+    // Skip memset — padding positions were zeroed at surface creation and only
+    // the active channel slots (stride=SP) are written, leaving padding as zeros.
     for (int i = 0; i < k->nInputs; i++) {
         IOSurfaceRef surf = k->ioInputs[i];
         if (IOSurfaceLock(surf, 0, NULL) != kIOReturnSuccess) return false;
 #if ANE_USE_NATIVE_FP16
         ane_fp16_t* base = (ane_fp16_t*)IOSurfaceGetBaseAddress(surf);
+        int ch = input_channels[i];
+#pragma clang loop vectorize(enable)
+        for (int c = 0, idx = 0; c < ch; c++, idx += SP)
+            base[idx] = (ane_fp16_t)inputs[i][c];
 #else
         uint16_t* base = (uint16_t*)IOSurfaceGetBaseAddress(surf);
-#endif
-        memset(base, 0, IOSurfaceGetAllocSize(surf));
         int ch = input_channels[i];
-        for (int c = 0; c < ch; c++) {
-#if ANE_USE_NATIVE_FP16
-            base[(size_t)c * SP] = (ane_fp16_t)inputs[i][c];
-#else
-            base[(size_t)c * SP] = f32_to_f16(inputs[i][c]);
+        for (int c = 0, idx = 0; c < ch; c++, idx += SP)
+            base[idx] = f32_to_f16(inputs[i][c]);
 #endif
-        }
         IOSurfaceUnlock(surf, 0, NULL);
     }
     
