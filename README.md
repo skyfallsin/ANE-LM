@@ -55,6 +55,18 @@ Download models in safetensors format from HuggingFace (e.g. `Qwen/Qwen3-4B`, `Q
 -v, --verbose        Show detailed initialization info
 ```
 
+### Experimental env flags
+
+```bash
+ANE_PREFILL_BATCH=4                # W-lane prefill batching (default 4, max 32)
+ANE_SPECULATIVE_DECODE=1           # experimental speculative decode for Qwen3
+ANE_SPECULATIVE_BATCH=32           # speculative verify batch size / W-lanes to use (default 32)
+ANE_SPECULATIVE_DRAFT_LAYERS=2     # truncated self-draft depth (default 2)
+ANE_SPECULATIVE_STATS=1            # print speculative accept/attempt stats at the end of generation
+```
+
+Speculative decode is still experimental and currently **slower than baseline** on the tested Qwen3 draft-model paths, even after fixing the acceptance logic with proper rejection sampling. Keep it off by default unless you're actively benchmarking it.
+
 ## Performance
 
 | Model | Params | Gen tok/s | Init (cached) | Dispatches/token | FFN Strategy |
