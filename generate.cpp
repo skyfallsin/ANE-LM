@@ -3,9 +3,22 @@
 #include <ane_lm/common.h>
 #include <climits>
 #include <cstdint>
+#include <cstdlib>
 #include <algorithm>
 
 namespace ane_lm {
+
+static bool speculative_decode_enabled() {
+    return getenv("ANE_SPECULATIVE_DECODE") != nullptr;
+}
+
+static bool speculative_stats_enabled() {
+    return getenv("ANE_SPECULATIVE_STATS") != nullptr;
+}
+
+static bool is_stop_token(int token, const Tokenizer& tokenizer) {
+    return token == tokenizer.eos_id() || token == tokenizer.im_end_id();
+}
 
 static bool is_utf8_continuation(uint8_t b) {
     return (b & 0xC0u) == 0x80u;
@@ -34,59 +47,79 @@ void stream_generate(
     int max_tokens,
     bool enable_thinking,
     const SamplingParams& sampling,
-    std::function<void(const GenerationResponse&)> callback)
+    std::function<void(const GenerationResponse&)> callback,
+    DraftModelContext* draft)
 {
-    // Tokenize with chat template
-    std::vector<int> prompt_tokens;
+    std::string formatted;
     if (tokenizer.has_chat_template()) {
-        std::string formatted = tokenizer.apply_chat_template(messages, true, enable_thinking);
-        prompt_tokens = tokenizer.encode(formatted);
+        formatted = tokenizer.apply_chat_template(messages, true, enable_thinking);
     } else {
-        // Fallback: concatenate all message contents
-        std::string combined;
         for (auto& [role, content] : messages) {
-            combined += content + "\n";
+            (void)role;
+            formatted += content + "\n";
         }
-        prompt_tokens = tokenizer.encode(combined);
+    }
+    std::vector<int> prompt_tokens = tokenizer.encode(formatted);
+
+    bool use_external_speculative =
+        draft && draft->model && draft->tokenizer &&
+        model.supports_external_draft_decode() &&
+        draft->model->supports_speculative_decode();
+
+    if (use_external_speculative) {
+        std::vector<int> draft_prompt_tokens = draft->tokenizer->encode(formatted);
+        if (draft_prompt_tokens != prompt_tokens) {
+            fprintf(stderr, "Draft model tokenizer mismatch — disabling external speculation\n");
+            use_external_speculative = false;
+        } else if (draft->tokenizer->eos_id() != tokenizer.eos_id() ||
+                   draft->tokenizer->im_end_id() != tokenizer.im_end_id()) {
+            fprintf(stderr, "Draft model stop-token mismatch — disabling external speculation\n");
+            use_external_speculative = false;
+        }
     }
 
-    // Prefill
     Timer prefill_timer;
-    float* logits = nullptr;
-    for (int i = 0; i < (int)prompt_tokens.size(); i++) {
-        logits = model.forward(prompt_tokens[i], i);
-        if (!logits) {
-            fprintf(stderr, "Forward failed during prefill at token index %d\n", i);
-            return;
-        }
+    float* logits = model.prefill(prompt_tokens, 0);
+    if (!logits) {
+        fprintf(stderr, "Forward failed during prefill\n");
+        return;
     }
     double prefill_ms = prefill_timer.elapsed_ms();
     double prompt_tps = prompt_tokens.size() / (prefill_ms / 1000.0);
 
-    // Sample only over token ids supported by both model logits and tokenizer decode.
+    bool use_internal_speculative = !use_external_speculative &&
+        speculative_decode_enabled() && model.supports_speculative_decode();
+    if (use_internal_speculative && !model.init_speculative(prompt_tokens, 0)) {
+        use_internal_speculative = false;
+    }
+    if (use_external_speculative) {
+        if (!draft->model->init_speculative(prompt_tokens, 0) ||
+            !model.init_external_draft_verify(prompt_tokens, 0)) {
+            fprintf(stderr, "Failed to initialize external speculative draft path\n");
+            use_external_speculative = false;
+        }
+    }
+
     int sampler_vocab = std::min(model.vocab_size(), tokenizer.vocab_size());
+    if (use_external_speculative) {
+        sampler_vocab = std::min(sampler_vocab, draft->model->vocab_size());
+        sampler_vocab = std::min(sampler_vocab, draft->tokenizer->vocab_size());
+    }
     if (sampler_vocab <= 0) {
         fprintf(stderr, "Invalid sampler vocab size: %d\n", sampler_vocab);
         return;
     }
 
-    // Decode
     Timer gen_timer;
     int n_generated = 0;
     std::vector<int> generated_tokens;
     std::string emitted_text;
     std::string prev_decoded;
     bool has_prev_decoded = false;
-    int next_token = sample_token(logits, sampler_vocab, sampling, generated_tokens);
 
-    int limit = (max_tokens > 0) ? max_tokens : INT_MAX;
-    for (int i = 0; i < limit; i++) {
-        if (next_token == tokenizer.eos_id() || next_token == tokenizer.im_end_id()) {
-            break;
-        }
-
+    auto emit_token = [&](int token) {
         n_generated++;
-        generated_tokens.push_back(next_token);
+        generated_tokens.push_back(token);
         std::string current_decoded = tokenizer.decode(generated_tokens);
 
         std::string piece;
@@ -99,7 +132,6 @@ void stream_generate(
                 piece = stable_decoded.substr(emitted_text.size());
                 emitted_text = std::move(stable_decoded);
             } else {
-                // Fallback: find current common prefix with emitted text first.
                 size_t p = longest_common_prefix_len(stable_decoded, emitted_text);
                 p = utf8_boundary_at_or_before(stable_decoded, p);
                 piece = stable_decoded.substr(p);
@@ -112,24 +144,297 @@ void stream_generate(
         if (callback) {
             GenerationResponse r;
             r.text = piece;
-            r.token = next_token;
+            r.token = token;
             r.prompt_tokens = (int)prompt_tokens.size();
             r.prompt_tps = prompt_tps;
             r.generation_tokens = n_generated;
             r.generation_tps = n_generated / (gen_timer.elapsed_ms() / 1000.0);
             callback(r);
         }
+    };
 
-        int pos = (int)prompt_tokens.size() + i;
+    auto sample_from_probs = [](const float* probs, int vocab_size) {
+        float r = (float)drand48();
+        float cum = 0.0f;
+        for (int i = 0; i < vocab_size; i++) {
+            cum += probs[i];
+            if (cum >= r) return i;
+        }
+        return vocab_size - 1;
+    };
+
+    std::vector<float> target_probs((size_t)sampler_vocab);
+    std::vector<float> draft_probs((size_t)sampler_vocab);
+    std::vector<float> diff_probs((size_t)sampler_vocab);
+
+    auto speculative_accept_or_sample = [&](const float* target_logits,
+                                            const float* draft_logits,
+                                            const std::vector<int>& context,
+                                            int drafted_token,
+                                            int* correction_token) {
+        compute_sampling_probs(target_probs.data(), target_logits, sampler_vocab, sampling, context);
+        compute_sampling_probs(draft_probs.data(), draft_logits, sampler_vocab, sampling, context);
+
+        float accept_prob = 0.0f;
+        if (drafted_token >= 0 && drafted_token < sampler_vocab) {
+            float p = target_probs[(size_t)drafted_token];
+            float q = draft_probs[(size_t)drafted_token];
+            if (q > 0.0f) {
+                accept_prob = std::min(1.0f, p / q);
+            }
+        }
+
+        if ((float)drand48() < accept_prob) {
+            *correction_token = drafted_token;
+            return true;
+        }
+
+        float total = 0.0f;
+        for (int i = 0; i < sampler_vocab; i++) {
+            float diff = target_probs[(size_t)i] - draft_probs[(size_t)i];
+            if (diff < 0.0f) diff = 0.0f;
+            diff_probs[(size_t)i] = diff;
+            total += diff;
+        }
+
+        if (total <= 1e-8f) {
+            *correction_token = sample_from_probs(target_probs.data(), sampler_vocab);
+            return false;
+        }
+
+        float inv_total = 1.0f / total;
+        for (int i = 0; i < sampler_vocab; i++) {
+            diff_probs[(size_t)i] *= inv_total;
+        }
+        *correction_token = sample_from_probs(diff_probs.data(), sampler_vocab);
+        return false;
+    };
+
+    bool show_speculative_stats = speculative_stats_enabled();
+    int speculative_attempts = 0;
+    int speculative_accepts = 0;
+
+    int limit = (max_tokens > 0) ? max_tokens : INT_MAX;
+    while (n_generated < limit) {
+        if (use_external_speculative) {
+            int draft_batch = std::min(limit - n_generated,
+                                       std::min(model.speculative_batch_size(),
+                                                draft->model->speculative_batch_size()));
+            if (draft_batch > 0) {
+                std::vector<int> drafted_tokens;
+                if (!draft->model->draft_speculative_tokens(draft_batch, sampler_vocab, sampling,
+                                                            generated_tokens, drafted_tokens)) {
+                    fprintf(stderr, "External speculative drafting failed at token %d\n", n_generated);
+                    return;
+                }
+                if (!drafted_tokens.empty()) {
+                    float* logits_batch = nullptr;
+                    int logits_stride = 0;
+                    if (!model.verify_speculative(drafted_tokens.data(), (int)drafted_tokens.size(),
+                                                  (int)prompt_tokens.size() + n_generated,
+                                                  &logits_batch, &logits_stride)) {
+                        fprintf(stderr, "External speculative verification failed at token %d\n", n_generated);
+                        return;
+                    }
+
+                    speculative_attempts += (int)drafted_tokens.size();
+                    int accepted = 0;
+                    int correction_token = -1;
+                    bool correction_emitted = false;
+                    bool stop_requested = false;
+                    float* current_logits = logits;
+                    std::vector<int> proposal_context = generated_tokens;
+
+                    for (int i = 0; i < (int)drafted_tokens.size() && n_generated < limit; i++) {
+                        const float* draft_logits = draft->model->draft_logits_at(i);
+                        if (!draft_logits) {
+                            break;
+                        }
+
+                        int sampled_token = -1;
+                        bool accepted_token = speculative_accept_or_sample(
+                            current_logits, draft_logits, proposal_context, drafted_tokens[i], &sampled_token);
+
+                        if (accepted_token) {
+                            accepted++;
+                            speculative_accepts++;
+                            if (is_stop_token(drafted_tokens[i], tokenizer)) {
+                                stop_requested = true;
+                                break;
+                            }
+                            emit_token(drafted_tokens[i]);
+                            proposal_context.push_back(drafted_tokens[i]);
+                            current_logits = logits_batch + (size_t)i * logits_stride;
+                            continue;
+                        }
+
+                        correction_token = sampled_token;
+                        if (is_stop_token(correction_token, tokenizer)) {
+                            stop_requested = true;
+                        } else {
+                            emit_token(correction_token);
+                            correction_emitted = true;
+                        }
+                        break;
+                    }
+
+                    model.finalize_external_draft_verify(accepted);
+                    draft->model->finalize_speculative(accepted);
+
+                    if (stop_requested) {
+                        break;
+                    }
+                    if (correction_emitted) {
+                        if (n_generated >= limit) {
+                            break;
+                        }
+                        int pos = (int)prompt_tokens.size() + n_generated - 1;
+                        logits = model.forward(correction_token, pos);
+                        if (!logits) {
+                            fprintf(stderr, "Forward failed during external speculative correction at token %d\n", n_generated);
+                            return;
+                        }
+                        if (!draft->model->accept_speculative_token(correction_token, pos)) {
+                            fprintf(stderr, "External draft-state correction advance failed at token %d\n", n_generated);
+                            return;
+                        }
+                        continue;
+                    }
+                    if (accepted > 0) {
+                        logits = current_logits;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        if (use_internal_speculative) {
+            int draft_batch = std::min(limit - n_generated, model.speculative_batch_size());
+            if (draft_batch > 0) {
+                int seed_token = sample_token(logits, sampler_vocab, sampling, generated_tokens);
+                if (is_stop_token(seed_token, tokenizer)) {
+                    break;
+                }
+
+                std::vector<int> drafted_tokens;
+                if (!model.draft_speculative_tokens(draft_batch, sampler_vocab, sampling,
+                                                   generated_tokens, drafted_tokens, seed_token)) {
+                    fprintf(stderr, "Speculative drafting failed at token %d\n", n_generated);
+                    return;
+                }
+                if (!drafted_tokens.empty()) {
+                    float* logits_batch = nullptr;
+                    int logits_stride = 0;
+                    if (!model.verify_speculative(drafted_tokens.data(), (int)drafted_tokens.size(),
+                                                  (int)prompt_tokens.size() + n_generated,
+                                                  &logits_batch, &logits_stride)) {
+                        fprintf(stderr, "Speculative verification failed at token %d\n", n_generated);
+                        return;
+                    }
+
+                    speculative_attempts += (int)drafted_tokens.size();
+                    int accepted = 0;
+                    int correction_token = -1;
+                    bool correction_emitted = false;
+                    bool stop_requested = false;
+                    float* current_logits = logits;
+                    std::vector<int> proposal_context = generated_tokens;
+
+                    accepted++;
+                    speculative_accepts++;
+                    emit_token(seed_token);
+                    proposal_context.push_back(seed_token);
+                    current_logits = logits_batch;
+
+                    for (int i = 1; i < (int)drafted_tokens.size() && n_generated < limit; i++) {
+                        const float* draft_logits = model.draft_logits_at(i);
+                        if (!draft_logits) {
+                            break;
+                        }
+
+                        int sampled_token = -1;
+                        bool accepted_token = speculative_accept_or_sample(
+                            current_logits, draft_logits, proposal_context, drafted_tokens[i], &sampled_token);
+
+                        if (accepted_token) {
+                            accepted++;
+                            speculative_accepts++;
+                            if (is_stop_token(drafted_tokens[i], tokenizer)) {
+                                stop_requested = true;
+                                break;
+                            }
+                            emit_token(drafted_tokens[i]);
+                            proposal_context.push_back(drafted_tokens[i]);
+                            current_logits = logits_batch + (size_t)i * logits_stride;
+                            continue;
+                        }
+
+                        correction_token = sampled_token;
+                        if (is_stop_token(correction_token, tokenizer)) {
+                            stop_requested = true;
+                        } else {
+                            emit_token(correction_token);
+                            correction_emitted = true;
+                        }
+                        break;
+                    }
+
+                    model.finalize_speculative(accepted);
+
+                    if (stop_requested) {
+                        break;
+                    }
+                    if (correction_emitted) {
+                        if (n_generated >= limit) {
+                            break;
+                        }
+                        int pos = (int)prompt_tokens.size() + n_generated - 1;
+                        logits = model.forward(correction_token, pos);
+                        if (!logits) {
+                            fprintf(stderr, "Forward failed during speculative correction at token %d\n", n_generated);
+                            return;
+                        }
+                        if (!model.accept_speculative_token(correction_token, pos)) {
+                            fprintf(stderr, "Speculative draft-state correction advance failed at token %d\n", n_generated);
+                            return;
+                        }
+                        continue;
+                    }
+                    if (accepted > 0) {
+                        logits = current_logits;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        int next_token = sample_token(logits, sampler_vocab, sampling, generated_tokens);
+        if (is_stop_token(next_token, tokenizer)) {
+            break;
+        }
+
+        emit_token(next_token);
+        if (n_generated >= limit) {
+            break;
+        }
+
+        int pos = (int)prompt_tokens.size() + n_generated - 1;
         logits = model.forward(next_token, pos);
         if (!logits) {
-            fprintf(stderr, "Forward failed during generation at step %d\n", i);
+            fprintf(stderr, "Forward failed during generation at token %d\n", n_generated);
             return;
         }
-        next_token = sample_token(logits, sampler_vocab, sampling, generated_tokens);
+        if (use_external_speculative) {
+            if (!draft->model->accept_speculative_token(next_token, pos)) {
+                fprintf(stderr, "External draft-state advance failed at token %d\n", n_generated);
+                return;
+            }
+        } else if (use_internal_speculative && !model.accept_speculative_token(next_token, pos)) {
+            fprintf(stderr, "Speculative draft-state advance failed at token %d\n", n_generated);
+            return;
+        }
     }
 
-    // Flush any remaining tail at end.
     if (callback && has_prev_decoded) {
         std::string final_decoded = prev_decoded;
         std::string tail;
@@ -155,7 +460,14 @@ void stream_generate(
         }
     }
 
-    // Final stats callback (token = -1 signals end)
+    if (show_speculative_stats && (use_internal_speculative || use_external_speculative)) {
+        double accept_pct = speculative_attempts > 0
+            ? (100.0 * speculative_accepts / speculative_attempts)
+            : 0.0;
+        fprintf(stderr, "\nSpeculative decode: %d/%d accepted (%.1f%%)\n",
+                speculative_accepts, speculative_attempts, accept_pct);
+    }
+
     if (callback) {
         GenerationResponse r;
         r.token = -1;
@@ -175,12 +487,13 @@ void stream_generate(
     int max_tokens,
     bool enable_thinking,
     const SamplingParams& sampling,
-    std::function<void(const GenerationResponse&)> callback)
+    std::function<void(const GenerationResponse&)> callback,
+    DraftModelContext* draft)
 {
     std::vector<std::pair<std::string, std::string>> messages = {
         {"user", prompt}
     };
-    stream_generate(model, tokenizer, messages, max_tokens, enable_thinking, sampling, std::move(callback));
+    stream_generate(model, tokenizer, messages, max_tokens, enable_thinking, sampling, std::move(callback), draft);
 }
 
 } // namespace ane_lm

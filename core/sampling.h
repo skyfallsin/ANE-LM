@@ -11,6 +11,10 @@ struct SamplingParams {
     float frequency_penalty = 0.1f;
 };
 
+void compute_sampling_probs(float* probs_out, const float* logits, int vocab_size,
+                            const SamplingParams& params,
+                            const std::vector<int>& recent_tokens = {});
+
 int sample_token(const float* logits, int vocab_size,
                  const SamplingParams& params,
                  const std::vector<int>& recent_tokens = {});

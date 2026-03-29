@@ -2,6 +2,7 @@
 
 #include "../../core/model_loader.h"
 #include "../../core/ane_runtime.h"
+#include "../../core/sampling.h"
 #include <nlohmann/json.hpp>
 #include <memory>
 #include <string>
@@ -20,6 +21,64 @@ public:
     virtual ~LLMModel() = default;
     virtual bool load(const std::string& model_dir) = 0;
     virtual float* forward(int token_id, int pos) = 0;
+    virtual float* prefill(const std::vector<int>& token_ids, int start_pos = 0) {
+        float* logits = nullptr;
+        for (int i = 0; i < (int)token_ids.size(); i++) {
+            logits = forward(token_ids[i], start_pos + i);
+            if (!logits) return nullptr;
+        }
+        return logits;
+    }
+    virtual bool supports_speculative_decode() const { return false; }
+    virtual bool init_speculative(const std::vector<int>& prompt_tokens, int start_pos = 0) {
+        (void)prompt_tokens;
+        (void)start_pos;
+        return false;
+    }
+    virtual int speculative_batch_size() const { return 0; }
+    virtual bool draft_speculative_tokens(int max_tokens, int sampler_vocab,
+                                          const SamplingParams& sampling,
+                                          const std::vector<int>& recent_tokens,
+                                          std::vector<int>& drafted_tokens,
+                                          int seed_token = -1) {
+        (void)max_tokens;
+        (void)sampler_vocab;
+        (void)sampling;
+        (void)recent_tokens;
+        (void)seed_token;
+        drafted_tokens.clear();
+        return false;
+    }
+    virtual const float* draft_logits_at(int position) const {
+        (void)position;
+        return nullptr;
+    }
+    virtual bool verify_speculative(const int* token_ids, int batch, int start_pos,
+                                    float** logits_batch, int* logits_stride) {
+        (void)token_ids;
+        (void)batch;
+        (void)start_pos;
+        if (logits_batch) *logits_batch = nullptr;
+        if (logits_stride) *logits_stride = 0;
+        return false;
+    }
+    virtual void finalize_speculative(int accepted_tokens) {
+        (void)accepted_tokens;
+    }
+    virtual bool accept_speculative_token(int token_id, int pos) {
+        (void)token_id;
+        (void)pos;
+        return false;
+    }
+    virtual bool supports_external_draft_decode() const { return false; }
+    virtual bool init_external_draft_verify(const std::vector<int>& prompt_tokens, int start_pos = 0) {
+        (void)prompt_tokens;
+        (void)start_pos;
+        return false;
+    }
+    virtual void finalize_external_draft_verify(int accepted_tokens) {
+        (void)accepted_tokens;
+    }
     virtual void reset() = 0;
     virtual int vocab_size() const = 0;
 };
