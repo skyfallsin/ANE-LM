@@ -5,3 +5,6 @@ example/
 .idea
 # R&D test files (local only)
 test_*.cpp
+
+# Local HuggingFace model downloads
+hf-models/
