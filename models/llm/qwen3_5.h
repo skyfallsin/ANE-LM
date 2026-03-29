@@ -121,6 +121,7 @@ public:
     ~Qwen35Model() override;
     bool load(const std::string& model_dir) override;
     float* forward(int token_id, int pos) override;
+    float* prefill(const std::vector<int>& token_ids, int start_pos = 0) override;
     void reset() override;
     int vocab_size() const override { return vocab_size_; }
 
