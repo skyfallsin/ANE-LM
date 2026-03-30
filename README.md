@@ -4,7 +4,16 @@ LLM inference on Apple Neural Engine (ANE) using private `AppleNeuralEngine.fram
 
 ane.cpp focuses on running dense Qwen-family models directly on ANE, then improving throughput through measurement-driven changes to kernel structure, dispatch count, and batching.
 
-A companion repo, [apple-neural-engine-field-guide](https://github.com/skyfallsin/apple-neural-engine-field-guide), documents the reverse-engineering work behind the runtime. That repo follows a [karpathy/autoresearch](https://github.com/karpathy/autoresearch)-style loop: write a focused probe, measure it, keep or discard it, then port the findings that hold up into ane.cpp. The workflow is described in [program.md](https://github.com/skyfallsin/apple-neural-engine-field-guide/blob/main/program.md).
+## Companion field guide
+
+This repo has a companion research repo:
+
+- 📚 **Field guide:** [apple-neural-engine-field-guide](https://github.com/skyfallsin/apple-neural-engine-field-guide)
+- 🧪 **Experiment log:** [results.tsv](https://github.com/skyfallsin/apple-neural-engine-field-guide/blob/main/results.tsv)
+- 🔬 **Test programs:** [tests/README.md](https://github.com/skyfallsin/apple-neural-engine-field-guide/blob/main/tests/README.md)
+- ♻️ **Autoresearch workflow:** [program.md](https://github.com/skyfallsin/apple-neural-engine-field-guide/blob/main/program.md)
+
+The field guide documents the reverse-engineering work behind the runtime and follows a [karpathy/autoresearch](https://github.com/karpathy/autoresearch)-style loop: write a focused probe, measure it, keep or discard it, then port the findings that hold up into ane.cpp.
 
 ## Current status
 
