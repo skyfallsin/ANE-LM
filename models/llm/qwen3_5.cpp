@@ -1290,16 +1290,19 @@ float* Qwen35Model::prefill_cpu(Session& session, const std::vector<int>& token_
 
     double total_gemm_ms = 0, total_attn_ms = 0, total_ffn_ms = 0;
     double delta_attn_ms = 0, full_attn_ms = 0;
+    double total_norm_ms = 0, total_conv_ms = 0;
 
     for (int L = 0; L < num_layers_; L++) {
         auto& cw = cpu_weights_[L];
 
         // 1. RMSNorm
+        Timer norm_timer;
         for (int i = 0; i < N; i++) {
             rmsnorm(X_norm.data() + (size_t)i * H,
                     X.data() + (size_t)i * H,
                     layers_[L].input_layernorm, H, rms_eps_);
         }
+        total_norm_ms += norm_timer.elapsed_ms();
 
         const bool is_linear = layer_types_[L] == LayerType::LinearAttention;
         const int proj_rows = cw.first_proj_rows;
@@ -1351,6 +1354,7 @@ float* Qwen35Model::prefill_cpu(Session& session, const std::vector<int>& token_
 
             // Phase 1: Sequential conv1d + silu for all N tokens
             // (conv1d has causal state dependency across tokens)
+            Timer conv_timer;
             for (int i = 0; i < N; i++) {
                 float* mixed_qkv = Proj.data() + (size_t)i * max_proj;
                 float* conv_out_i = conv_batch.data() + (size_t)i * lin_qkv_dim_;
@@ -1358,6 +1362,8 @@ float* Qwen35Model::prefill_cpu(Session& session, const std::vector<int>& token_
                               mixed_qkv, dw.conv1d_w, lin_qkv_dim_, conv_kernel_);
                 silu_vec_inplace(conv_out_i, lin_qkv_dim_, session.scratch_tmp);
             }
+
+            total_conv_ms += conv_timer.elapsed_ms();
 
             // Phase 2: Parallel across key heads — each head processes all N tokens
             // Each key head's Q/K/V slices are non-overlapping, states are independent
@@ -1586,11 +1592,13 @@ float* Qwen35Model::prefill_cpu(Session& session, const std::vector<int>& token_
         total_gemm_ms += oproj_timer.elapsed_ms();
 
         // 6. Post-attention RMSNorm
+        norm_timer.reset();
         for (int i = 0; i < N; i++) {
             rmsnorm(X_norm.data() + (size_t)i * H,
                     X.data() + (size_t)i * H,
                     layers_[L].post_attention_layernorm, H, rms_eps_);
         }
+        total_norm_ms += norm_timer.elapsed_ms();
 
         // 7. FFN via GEMM
         Timer ffn_timer;
@@ -1636,8 +1644,8 @@ float* Qwen35Model::prefill_cpu(Session& session, const std::vector<int>& token_
     matvec(session.logits, cpu_lm_head_, session.x, vocab_size_, H);
 
     double elapsed = total_timer.elapsed_ms();
-    fprintf(stderr, "[cpu_prefill] %d tokens in %.1f ms (%.1f tok/s) | gemm=%.0fms attn=%.0fms (delta=%.0f full=%.0f) ffn=%.0fms\n",
-            N, elapsed, N / (elapsed / 1000.0), total_gemm_ms, total_attn_ms, delta_attn_ms, full_attn_ms, total_ffn_ms);
+    fprintf(stderr, "[cpu_prefill] %d tokens in %.1f ms (%.1f tok/s) | gemm=%.0fms attn=%.0fms (delta=%.0f[conv=%.0f] full=%.0f) ffn=%.0fms norm=%.0fms\n",
+            N, elapsed, N / (elapsed / 1000.0), total_gemm_ms, total_attn_ms, delta_attn_ms, total_conv_ms, full_attn_ms, total_ffn_ms, total_norm_ms);
 
     return session.logits;
 }

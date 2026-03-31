@@ -45,6 +45,13 @@ void l2_normalize(float* x, int dim);
 void conv1d_update(float* y, float* conv_state, int* state_pos, const float* x,
                    const float* w, int channels, int kernel_size);
 
+// Batch conv1d for prefill: process N tokens at once, output to y_batch[N*channels]
+// x_batch[N*channels] is the input (e.g. from Proj), stride between tokens = x_stride
+// Updates conv_state and state_pos for subsequent decode tokens.
+void conv1d_batch(float* y_batch, float* conv_state, int* state_pos,
+                  const float* x_batch, int x_stride,
+                  const float* w, int channels, int kernel_size, int N);
+
 // ============ SSM Recurrence ============
 
 void ssm_step(float* y, float* state, const float* q, const float* k,

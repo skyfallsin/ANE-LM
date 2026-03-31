@@ -1,6 +1,9 @@
 #include "cpu_ops.h"
 #include <alloca.h>
 #include <cstdlib>
+#if defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
 
 namespace ane_lm {
 
@@ -131,10 +134,91 @@ void conv1d_update(float* y, float* conv_state, int* state_pos, const float* x,
     *state_pos = pos;
 }
 
+void conv1d_batch(float* y_batch, float* conv_state, int* state_pos,
+                  const float* x_batch, int x_stride,
+                  const float* w, int channels, int kernel_size, int N) {
+    if (kernel_size != 4 || N <= 0) {
+        // Fallback to per-token
+        for (int i = 0; i < N; i++) {
+            conv1d_update(y_batch + (size_t)i * channels, conv_state, state_pos,
+                          x_batch + (size_t)i * x_stride, w, channels, kernel_size);
+        }
+        return;
+    }
+
+    // Kernel_size=4 fast path: unroll the sliding window
+    // State has 3 slots per channel (kernel_size-1), circular buffer at *state_pos
+    const int state_len = 3;
+    int pos = *state_pos;
+
+    // Precompute initial state layout: s[0], s[1], s[2] in temporal order
+    // state[c*3 + ((pos+j) % 3)] is the j-th oldest value for channel c
+    // For kernel_size=4: y = s_oldest*w0 + s_mid*w1 + s_newest*w2 + x*w3
+
+    // Process all channels in vectorized fashion per token
+    for (int i = 0; i < N; i++) {
+        const float* x_tok = x_batch + (size_t)i * x_stride;
+        float* y_tok = y_batch + (size_t)i * channels;
+
+        int p0 = pos;
+        int p1 = (pos + 1); if (p1 >= state_len) p1 -= state_len;
+        int p2 = (p1 + 1);  if (p2 >= state_len) p2 -= state_len;
+
+        // Process 4 channels at a time with NEON
+        int c = 0;
+#if defined(__ARM_NEON__)
+        for (; c + 3 < channels; c += 4) {
+            const int sb0 = c * 3, sb1 = (c+1) * 3, sb2 = (c+2) * 3, sb3 = (c+3) * 3;
+            const int wb0 = c * 4, wb1 = (c+1) * 4, wb2 = (c+2) * 4, wb3 = (c+3) * 4;
+
+            // Load state values for 4 channels
+            float32x4_t s0 = {conv_state[sb0+p0], conv_state[sb1+p0], conv_state[sb2+p0], conv_state[sb3+p0]};
+            float32x4_t s1 = {conv_state[sb0+p1], conv_state[sb1+p1], conv_state[sb2+p1], conv_state[sb3+p1]};
+            float32x4_t s2 = {conv_state[sb0+p2], conv_state[sb1+p2], conv_state[sb2+p2], conv_state[sb3+p2]};
+            float32x4_t xv = vld1q_f32(x_tok + c);
+
+            // Load weights for 4 channels (strided by 4)
+            float32x4_t w0 = {w[wb0], w[wb1], w[wb2], w[wb3]};
+            float32x4_t w1 = {w[wb0+1], w[wb1+1], w[wb2+1], w[wb3+1]};
+            float32x4_t w2 = {w[wb0+2], w[wb1+2], w[wb2+2], w[wb3+2]};
+            float32x4_t w3 = {w[wb0+3], w[wb1+3], w[wb2+3], w[wb3+3]};
+
+            float32x4_t result = vmulq_f32(s0, w0);
+            result = vfmaq_f32(result, s1, w1);
+            result = vfmaq_f32(result, s2, w2);
+            result = vfmaq_f32(result, xv, w3);
+            vst1q_f32(y_tok + c, result);
+
+            // Update state: overwrite oldest slot with current input
+            conv_state[sb0+p0] = x_tok[c];
+            conv_state[sb1+p0] = x_tok[c+1];
+            conv_state[sb2+p0] = x_tok[c+2];
+            conv_state[sb3+p0] = x_tok[c+3];
+        }
+#endif
+        // Scalar remainder
+        for (; c < channels; c++) {
+            const int sbase = c * 3;
+            const int wbase = c * 4;
+            float sv0 = conv_state[sbase + p0];
+            float sv1 = conv_state[sbase + p1];
+            float sv2 = conv_state[sbase + p2];
+            float xc = x_tok[c];
+            y_tok[c] = sv0 * w[wbase] + sv1 * w[wbase+1] + sv2 * w[wbase+2] + xc * w[wbase+3];
+            conv_state[sbase + p0] = xc;
+        }
+
+        pos++;
+        if (pos >= state_len) pos = 0;
+    }
+
+    *state_pos = pos;
+}
+
 void ssm_step(float* y, float* state, const float* q, const float* k,
               const float* v, float decay, float beta, int key_dim, int value_dim) {
-    static bool use_fused = getenv("ANE_SSM_OLD") == nullptr;
-    if (!use_fused) {
+    static bool use_blas = getenv("ANE_SSM_OLD") != nullptr;
+    if (use_blas) {
         float* Sk = (float*)alloca(value_dim * sizeof(float));
         cblas_sgemv(CblasRowMajor, CblasTrans, key_dim, value_dim, 1.0f,
                     state, value_dim, k, 1, 0.0f, Sk, 1);
@@ -151,6 +235,8 @@ void ssm_step(float* y, float* state, const float* q, const float* k,
         return;
     }
 
+    // Fused two-pass approach: auto-vectorized by Clang -O3 -ffast-math
+    // Pass 1: Sk = state^T @ k
     float* Sk = (float*)alloca(value_dim * sizeof(float));
     float* delta = (float*)alloca(value_dim * sizeof(float));
     memset(Sk, 0, (size_t)value_dim * sizeof(float));
@@ -168,6 +254,7 @@ void ssm_step(float* y, float* state, const float* q, const float* k,
         y[j] = 0.0f;
     }
 
+    // Pass 2: fused state update + output accumulation
     for (int i = 0; i < key_dim; i++) {
         const float q_i = q[i];
         const float beta_k_i = beta * k[i];
