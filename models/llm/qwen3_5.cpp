@@ -1274,10 +1274,16 @@ float* Qwen35Model::prefill_cpu(Session& session, const std::vector<int>& token_
     std::vector<float> Y_batch((size_t)N * lin_total_val_);    // ssm output per token
 
     // Batch buffers for full-attention prefill
-    // Q layout: [N, num_q_heads, head_dim*2] (includes gate), K: [N, num_kv_heads, head_dim], V: same
-    std::vector<float> fullQ((size_t)N * full_q_dim_);
     std::vector<float> fullK((size_t)N * full_kv_dim_);
     std::vector<float> fullV((size_t)N * full_kv_dim_);
+
+    // Pre-allocated per-head buffers for parallel full-attention (avoid malloc in dispatch_apply)
+    const int fa_nqh = num_q_heads_;
+    std::vector<float> fa_scores((size_t)fa_nqh * N * N);       // [nqh, N, N]
+    std::vector<float> fa_q_buf((size_t)fa_nqh * N * head_dim_);  // [nqh, N, hd]
+    std::vector<float> fa_k_buf((size_t)num_kv_heads_ * N * head_dim_);  // [nkvh, N, hd]
+    std::vector<float> fa_v_buf((size_t)num_kv_heads_ * N * head_dim_);  // [nkvh, N, hd]
+    std::vector<float> fa_out_buf((size_t)fa_nqh * N * head_dim_);  // [nqh, N, hd]
 
     dispatch_queue_t par_queue = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
 
@@ -1502,67 +1508,71 @@ float* Qwen35Model::prefill_cpu(Session& session, const std::vector<int>& token_
             // Parallel across all Q heads: each head does gather, Q@K^T, softmax, scores@V, scatter
             // 16 Q heads with 4 KV groups → 4 Q heads share each K/V
             // Per-thread: allocate scores[N,N], q_buf[N,hd], out[N,hd] on heap
-            const int total_q_heads = nqh;
-            const float* fK = fullK.data();
-            const float* fV = fullV.data();
             float* proj_data = Proj.data();
             float* oproj_data = Oproj.data();
             const bool do_gate = attn_output_gate_;
 
+            // Pre-gather K, V into contiguous [nkvh, N, hd] (once per KV head, not per Q head)
+            for (int kvh = 0; kvh < nkvh; kvh++) {
+                float* kb = fa_k_buf.data() + (size_t)kvh * N * hd;
+                float* vb = fa_v_buf.data() + (size_t)kvh * N * hd;
+                for (int i = 0; i < N; i++) {
+                    memcpy(kb + (size_t)i * hd, fullK.data() + (size_t)i * kv_stride + kvh * hd, (size_t)hd * sizeof(float));
+                    memcpy(vb + (size_t)i * hd, fullV.data() + (size_t)i * kv_stride + kvh * hd, (size_t)hd * sizeof(float));
+                }
+            }
+
+            // Parallel across Q heads with pre-allocated buffers
+            const int total_q_heads = nqh;
+            float* fa_s = fa_scores.data();
+            float* fa_q = fa_q_buf.data();
+            float* fa_kb = fa_k_buf.data();
+            float* fa_vb = fa_v_buf.data();
+            float* fa_o = fa_out_buf.data();
+
             dispatch_apply((size_t)total_q_heads, par_queue, ^(size_t h_idx) {
                 int h = (int)h_idx;
                 int kvh = h / groups;
+                const size_t NN = (size_t)N * N;
+                const size_t Nhd = (size_t)N * hd;
 
-                // Thread-local buffers
-                std::vector<float> scores((size_t)N * N);
-                std::vector<float> q_buf((size_t)N * hd);
-                std::vector<float> k_buf((size_t)N * hd);
-                std::vector<float> v_buf((size_t)N * hd);
-                std::vector<float> out_buf((size_t)N * hd);
-
-                // Gather K, V for this KV head
-                for (int i = 0; i < N; i++) {
-                    memcpy(k_buf.data() + (size_t)i * hd,
-                           fK + (size_t)i * kv_stride + kvh * hd,
-                           (size_t)hd * sizeof(float));
-                    memcpy(v_buf.data() + (size_t)i * hd,
-                           fV + (size_t)i * kv_stride + kvh * hd,
-                           (size_t)hd * sizeof(float));
-                }
+                float* scores = fa_s + h * NN;
+                float* q_buf = fa_q + h * Nhd;
+                float* out_buf = fa_o + h * Nhd;
+                const float* k_buf = fa_kb + (size_t)kvh * Nhd;
+                const float* v_buf = fa_vb + (size_t)kvh * Nhd;
 
                 // Gather Q for this head
                 for (int i = 0; i < N; i++) {
-                    memcpy(q_buf.data() + (size_t)i * hd,
+                    memcpy(q_buf + (size_t)i * hd,
                            proj_data + (size_t)i * max_proj + (size_t)h * hd * 2,
                            (size_t)hd * sizeof(float));
                 }
 
-                // scores = scale * Q @ K^T : [N, hd] × [hd, N] → [N, N]
+                // scores = scale * Q @ K^T
                 cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                             N, N, hd, scale,
-                            q_buf.data(), hd,
-                            k_buf.data(), hd,
-                            0.0f, scores.data(), N);
+                            q_buf, hd, k_buf, hd,
+                            0.0f, scores, N);
 
                 // Causal mask + softmax
                 for (int i = 0; i < N; i++) {
-                    float* row = scores.data() + (size_t)i * N;
+                    float* row = scores + (size_t)i * N;
                     for (int j = i + 1; j < N; j++) row[j] = -1e9f;
                     softmax(row, N);
                 }
 
-                // out = scores @ V : [N, N] × [N, hd] → [N, hd]
+                // out = scores @ V
                 cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                             N, hd, N, 1.0f,
-                            scores.data(), N,
-                            v_buf.data(), hd,
-                            0.0f, out_buf.data(), hd);
+                            scores, N, v_buf, hd,
+                            0.0f, out_buf, hd);
 
                 // Output gating + scatter into Oproj
                 float tmp[256];
                 for (int i = 0; i < N; i++) {
                     float* dst = oproj_data + (size_t)i * max_attn + (size_t)h * hd;
-                    float* src = out_buf.data() + (size_t)i * hd;
+                    float* src = out_buf + (size_t)i * hd;
                     if (do_gate) {
                         const float* gh = proj_data + (size_t)i * max_proj + (size_t)h * hd * 2 + hd;
                         memcpy(dst, src, (size_t)hd * sizeof(float));
