@@ -280,6 +280,23 @@ float* SafeTensors::load_bf16_to_f32(const char* name, int64_t expected_numel) c
     return out;
 }
 
+uint16_t* SafeTensors::load_bf16_to_f16(const char* name, int64_t expected_numel) const {
+    const SFTensor* t = find(name);
+    if (!t) {
+        fprintf(stderr, "Weight not found: %s\n", name);
+        return nullptr;
+    }
+    int64_t n = numel(t);
+    if (expected_numel > 0 && n != expected_numel) {
+        fprintf(stderr, "Shape mismatch for %s: expected %lld, got %lld\n", name, expected_numel, n);
+        return nullptr;
+    }
+    uint16_t* out = (uint16_t*)malloc(n * sizeof(uint16_t));
+    const uint16_t* bf16 = (const uint16_t*)data(t);
+    bf16_to_f16_vec(out, bf16, (int)n);
+    return out;
+}
+
 float* SafeTensors::load_f32_direct(const char* name, int64_t expected_numel) const {
     const SFTensor* t = find(name);
     if (!t) {

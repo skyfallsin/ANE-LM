@@ -142,6 +142,15 @@ float* ModelWeights::load_bf16_to_f32(const char* name, int64_t expected_numel) 
     return sf->load_bf16_to_f32(name, expected_numel);
 }
 
+uint16_t* ModelWeights::load_bf16_to_f16(const char* name, int64_t expected_numel) const {
+    const SafeTensors* sf = owner_for(name);
+    if (!sf) {
+        fprintf(stderr, "Weight not found: %s\n", name);
+        return nullptr;
+    }
+    return sf->load_bf16_to_f16(name, expected_numel);
+}
+
 float* ModelWeights::load_f32_direct(const char* name, int64_t expected_numel) const {
     const SafeTensors* sf = owner_for(name);
     if (!sf) {

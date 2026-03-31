@@ -17,6 +17,7 @@ public:
     const uint16_t* get_bf16_ptr(const char* name) const;
 
     float* load_bf16_to_f32(const char* name, int64_t expected_numel = -1) const;
+    uint16_t* load_bf16_to_f16(const char* name, int64_t expected_numel = -1) const;
     float* load_f32_direct(const char* name, int64_t expected_numel = -1) const;
     float* load_norm_weight(const char* name, int64_t expected_numel) const;
 
