@@ -4,6 +4,7 @@
 #include <fstream>
 #include <sys/stat.h>
 #include <mutex>
+#include <dispatch/dispatch.h>
 
 namespace ane_lm {
 
@@ -1268,6 +1269,21 @@ float* Qwen35Model::prefill_cpu(Session& session, const std::vector<int>& token_
     std::vector<float> A_batch((size_t)N * lin_num_val_heads_);
     std::vector<float> B_batch((size_t)N * lin_num_val_heads_);
 
+    // Batch buffers for parallelized DeltaNet
+    std::vector<float> conv_batch((size_t)N * lin_qkv_dim_);  // conv1d output per token
+    std::vector<float> Y_batch((size_t)N * lin_total_val_);    // ssm output per token
+
+    // Batch buffers for full-attention prefill
+    // Q layout: [N, num_q_heads, head_dim*2] (includes gate), K: [N, num_kv_heads, head_dim], V: same
+    std::vector<float> fullQ((size_t)N * full_q_dim_);
+    std::vector<float> fullK((size_t)N * full_kv_dim_);
+    std::vector<float> fullV((size_t)N * full_kv_dim_);
+
+    // Merged gate+up weight (allocated once, populated per layer)
+    std::vector<float> GateUp((size_t)N * 2 * I);
+
+    dispatch_queue_t par_queue = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
+
     // Embedding lookup
     for (int i = 0; i < N; i++) {
         memcpy(X.data() + (size_t)i * H,
@@ -1329,57 +1345,89 @@ float* Qwen35Model::prefill_cpu(Session& session, const std::vector<int>& token_
 
         total_gemm_ms += gemm_timer.elapsed_ms();
 
-        // 3. Per-token attention core
+        // 3. Attention core
         Timer attn_timer;
-        for (int i = 0; i < N; i++) {
-            float* proj = Proj.data() + (size_t)i * max_proj;
-            float* pre_oproj = Oproj.data() + (size_t)i * max_attn;
-            int pos = start_pos + i;
+        if (is_linear) {
+            auto& dw = layers_[L].deltanet;
+            const int val_heads_per_key = lin_num_val_heads_ / lin_num_heads_;
+            const float q_scale = 1.0f / sqrtf((float)lin_key_dim_);
 
-            if (is_linear) {
-                auto& dw = layers_[L].deltanet;
-                float* mixed_qkv = proj;
-                float* z_ptr = Z_batch.data() + (size_t)i * lin_total_val_;
-                float* a_vec = A_batch.data() + (size_t)i * lin_num_val_heads_;
-                float* b_vec = B_batch.data() + (size_t)i * lin_num_val_heads_;
-
-                float* conv_out = session.scratch_conv;
-                conv1d_update(conv_out, session.delta_conv_state[L], &session.delta_conv_pos[L],
+            // Phase 1: Sequential conv1d + silu for all N tokens
+            // (conv1d has causal state dependency across tokens)
+            for (int i = 0; i < N; i++) {
+                float* mixed_qkv = Proj.data() + (size_t)i * max_proj;
+                float* conv_out_i = conv_batch.data() + (size_t)i * lin_qkv_dim_;
+                conv1d_update(conv_out_i, session.delta_conv_state[L], &session.delta_conv_pos[L],
                               mixed_qkv, dw.conv1d_w, lin_qkv_dim_, conv_kernel_);
-                silu_vec_inplace(conv_out, lin_qkv_dim_, session.scratch_tmp);
+                silu_vec_inplace(conv_out_i, lin_qkv_dim_, session.scratch_tmp);
+            }
 
-                float* Q = conv_out;
-                float* K = conv_out + lin_total_key_;
-                float* V = conv_out + lin_total_key_ * 2;
-                float* y = session.scratch_y;
-                float q_scale = 1.0f / sqrtf((float)lin_key_dim_);
-                int val_heads_per_key = lin_num_val_heads_ / lin_num_heads_;
+            // Phase 2: Parallel across key heads — each head processes all N tokens
+            // Each key head's Q/K/V slices are non-overlapping, states are independent
+            const int num_kh = lin_num_heads_;
+            const int key_dim = lin_key_dim_;
+            const int val_dim = lin_val_dim_;
+            const int total_key = lin_total_key_;
+            const int total_val = lin_total_val_;
+            const int num_vh = lin_num_val_heads_;
+            const int qkv_dim = lin_qkv_dim_;
+            float* conv_data = conv_batch.data();
+            float* y_data = Y_batch.data();
+            float* a_data = A_batch.data();
+            float* b_data = B_batch.data();
+            float* oproj_data = Oproj.data();
+            float* z_data = Z_batch.data();
+            float** ssm_states = session.delta_ssm_state.data();
+            const float* dw_A = dw.A;
+            const float* dw_dt_bias = dw.dt_bias;
+            const float* dw_norm_w = dw.norm_w;
 
-                for (int kh = 0; kh < lin_num_heads_; kh++) {
-                    float* qh = Q + kh * lin_key_dim_;
-                    float* kh_ptr = K + kh * lin_key_dim_;
-                    l2_normalize(qh, lin_key_dim_);
-                    l2_normalize(kh_ptr, lin_key_dim_);
+            dispatch_apply((size_t)num_kh, par_queue, ^(size_t kh_idx) {
+                int kh = (int)kh_idx;
+                for (int i = 0; i < N; i++) {
+                    float* conv_out_i = conv_data + (size_t)i * qkv_dim;
+                    float* qh = conv_out_i + kh * key_dim;
+                    float* kh_ptr = conv_out_i + total_key + kh * key_dim;
+
+                    l2_normalize(qh, key_dim);
+                    l2_normalize(kh_ptr, key_dim);
                     float qs = q_scale;
-                    vDSP_vsmul(qh, 1, &qs, qh, 1, (vDSP_Length)lin_key_dim_);
+                    vDSP_vsmul(qh, 1, &qs, qh, 1, (vDSP_Length)key_dim);
+
+                    float* a_vec = a_data + (size_t)i * num_vh;
+                    float* b_vec = b_data + (size_t)i * num_vh;
+
                     for (int vsub = 0; vsub < val_heads_per_key; vsub++) {
                         int vh = kh * val_heads_per_key + vsub;
-                        float* vh_ptr = V + vh * lin_val_dim_;
-                        float* yh = y + vh * lin_val_dim_;
-                        float* state = session.delta_ssm_state[L] + (size_t)vh * lin_key_dim_ * lin_val_dim_;
+                        float* vh_ptr = conv_out_i + total_key * 2 + vh * val_dim;
+                        float* yh = y_data + (size_t)i * total_val + vh * val_dim;
+                        float* state = ssm_states[L] + (size_t)vh * key_dim * val_dim;
                         float beta = sigmoid_f(b_vec[vh]);
-                        float decay = expf(-dw.A[vh] * softplus_f(a_vec[vh] + dw.dt_bias[vh]));
-                        ssm_step(yh, state, qh, kh_ptr, vh_ptr, decay, beta, lin_key_dim_, lin_val_dim_);
+                        float decay = expf(-dw_A[vh] * softplus_f(a_vec[vh] + dw_dt_bias[vh]));
+                        ssm_step(yh, state, qh, kh_ptr, vh_ptr, decay, beta, key_dim, val_dim);
+                    }
+
+                    // rmsnorm_gated for this head's value heads (fused into parallel work)
+                    float* pre_oproj = oproj_data + (size_t)i * max_attn;
+                    float* z_ptr = z_data + (size_t)i * total_val;
+                    for (int vsub = 0; vsub < val_heads_per_key; vsub++) {
+                        int vh = kh * val_heads_per_key + vsub;
+                        float* yh = y_data + (size_t)i * total_val + vh * val_dim;
+                        rmsnorm_gated(pre_oproj + vh * val_dim,
+                                      yh,
+                                      z_ptr + vh * val_dim,
+                                      dw_norm_w, val_dim);
                     }
                 }
+            });
 
-                for (int h = 0; h < lin_num_val_heads_; h++) {
-                    rmsnorm_gated(pre_oproj + h * lin_val_dim_,
-                                  y + h * lin_val_dim_,
-                                  z_ptr + h * lin_val_dim_,
-                                  dw.norm_w, lin_val_dim_);
-                }
-            } else {
+        } else {
+            // Full attention: per-token (sequential KV cache build)
+            for (int i = 0; i < N; i++) {
+                float* proj = Proj.data() + (size_t)i * max_proj;
+                float* pre_oproj = Oproj.data() + (size_t)i * max_attn;
+                int pos = start_pos + i;
+
                 auto& fw = layers_[L].full_attn;
                 float* q_gate_raw = proj;
                 float* k_raw = proj + full_q_dim_;
@@ -1471,20 +1519,8 @@ float* Qwen35Model::prefill_cpu(Session& session, const std::vector<int>& token_
                     0.0f, Up.data(), I);
 
         // SwiGLU: silu(gate) * up
-        // silu(x) = x * sigmoid(x). Use vDSP for the heavy lifting:
-        // 1. Negate gate values in-place in Up (scratch)
-        // 2. Vectorized exp via vvexpf
-        // 3. Add 1, divide gate by result, multiply by up
-        // We need to preserve Up, so swap: compute gate activation first, then multiply.
         {
             const int total = N * I;
-            // Save Up to Down (N*H buffer, but we need N*I — allocate once outside loop)
-            // Actually: compute silu(Gate) in-place, then re-read Up for multiply.
-            // Use fast fused approach: write sigmoid into Gate, then elementwise.
-
-            // Fast path: process in chunks that fit L1 cache for locality
-            // silu(g) * u = g * sigmoid(g) * u = g * u / (1 + exp(-g))
-            // Use -ffast-math compiled expf — compiler should NEON-vectorize
             float* gp = Gate.data();
             float* up = Up.data();
             for (int i = 0; i < total; i++) {
