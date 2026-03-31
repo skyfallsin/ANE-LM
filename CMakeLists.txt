@@ -84,7 +84,7 @@ target_link_libraries(ane_cpp PRIVATE
 
 # Optimization for release
 target_compile_options(ane_cpp PRIVATE
-    $<$<CONFIG:Release>:-O3>
+    $<$<CONFIG:Release>:-O3 -ffast-math>
     $<$<CONFIG:RelWithDebInfo>:-O2 -g>
 )
 
@@ -106,3 +106,17 @@ target_link_libraries(test_quant_perf PRIVATE
     "-lobjc"
 )
 target_compile_options(test_quant_perf PRIVATE -O3)
+
+# INT4 benchmark test
+add_executable(test_int4_perf EXCLUDE_FROM_ALL
+    ../apple-neural-engine-field-guide/tests/test_int4_weight_perf.cpp
+    core/ane_runtime.cpp
+    common.cpp
+)
+target_link_libraries(test_int4_perf PRIVATE
+    "-framework Foundation"
+    "-framework IOSurface"
+    "-framework Accelerate"
+    "-lobjc"
+)
+target_compile_options(test_int4_perf PRIVATE -O3)
