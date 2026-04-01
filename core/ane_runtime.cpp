@@ -186,6 +186,7 @@ void ane_init() {
 }
 
 bool ane_available() { ane_init(); return g_ane_ok; }
+bool ane_use_int8() { ane_init(); return g_ane_use_int8; }
 
 // ============ IOSurface helpers ============
 

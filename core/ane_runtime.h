@@ -36,6 +36,7 @@ struct LayerANEKernels {
 // Global state
 void ane_init();
 bool ane_available();
+bool ane_use_int8();
 void ane_set_persist_cache(bool enabled);
 int ane_compile_count();
 int ane_cache_loads();

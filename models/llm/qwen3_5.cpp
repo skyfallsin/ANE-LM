@@ -607,8 +607,8 @@ bool Qwen35Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
         return false;
     }
 
-    bool use_blobs = !blob_dir.empty();
-    LOG("Compiling ANE kernels%s...\n", use_blobs ? " (from blobs)" : "");
+    bool use_blobs = !blob_dir.empty() && !ane_use_int8();
+    LOG("Compiling ANE kernels%s...\n", use_blobs ? " (from blobs)" : (ane_use_int8() ? " (INT8)" : ""));
     char name[256], name2[256], name3[256];
 
     for (int L = 0; L < num_layers_; L++) {
