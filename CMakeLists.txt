@@ -68,6 +68,7 @@ set(CORE_SOURCES
     core/safetensors.cpp
     core/model_loader.cpp
     core/weight_cache.cpp
+    core/gguf_loader.cpp
     core/tokenizer.cpp
     core/cpu_ops.cpp
     core/sampling.cpp
@@ -116,16 +117,20 @@ target_compile_definitions(ane_cpp PRIVATE
 
 set_target_properties(ane_cpp PROPERTIES OUTPUT_NAME "ane.cpp")
 
-# Link frameworks and ObjC runtime
+# Link frameworks, ObjC runtime, and ggml
 target_link_libraries(ane_cpp PRIVATE
     nlohmann_json::nlohmann_json
     tokenizers_cpp
+    ggml
     "-framework Foundation"
     "-framework IOSurface"
     "-framework Accelerate"
     "-framework Metal"
     "-framework MetalPerformanceShaders"
     "-lobjc"
+)
+target_include_directories(ane_cpp PRIVATE
+    ${ggml_SOURCE_DIR}/include
 )
 
 # Optimization for release
@@ -180,5 +185,24 @@ target_include_directories(test_ggml_metal PRIVATE
 )
 target_compile_options(test_ggml_metal PRIVATE -O3)
 set_target_properties(test_ggml_metal PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+)
+
+# GGUF loader test: load full model, verify shapes, run mul_mat
+add_executable(test_gguf_loader EXCLUDE_FROM_ALL
+    tests/test_gguf_loader.cpp
+    core/gguf_loader.cpp
+    common.cpp
+)
+target_link_libraries(test_gguf_loader PRIVATE
+    ggml
+    "-framework Accelerate"
+)
+target_include_directories(test_gguf_loader PRIVATE
+    ${ggml_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}
+)
+target_compile_options(test_gguf_loader PRIVATE -O3)
+set_target_properties(test_gguf_loader PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
 )
