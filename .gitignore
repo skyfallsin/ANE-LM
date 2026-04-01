@@ -3,8 +3,11 @@ example/
 .DS_Store
 *.dSYM/
 .idea
-# R&D test files (local only)
-test_*.cpp
+# R&D test files in repo root (local only)
+/test_*.cpp
+
+# Untracked R&D files in tests/ dir
+tests/test_ane_ssd_overlap*
 
 # Local HuggingFace model downloads
 hf-models/

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(ane.cpp VERSION 0.1.0 LANGUAGES C CXX OBJCXX)
+project(ane.cpp VERSION 0.1.0 LANGUAGES C CXX OBJC OBJCXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -25,7 +25,29 @@ FetchContent_Declare(
     GIT_SHALLOW    TRUE
 )
 
-FetchContent_MakeAvailable(json tokenizers_cpp)
+# ggml (core + Metal backend) for GPU GEMM
+# We only need ggml-core, ggml-metal, and gguf — disable everything else
+set(GGML_METAL        ON  CACHE BOOL "" FORCE)
+set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "" FORCE)
+set(GGML_METAL_NDEBUG ON  CACHE BOOL "" FORCE)
+set(GGML_CUDA         OFF CACHE BOOL "" FORCE)
+set(GGML_VULKAN       OFF CACHE BOOL "" FORCE)
+set(GGML_OPENCL       OFF CACHE BOOL "" FORCE)
+set(GGML_SYCL         OFF CACHE BOOL "" FORCE)
+set(GGML_RPC          OFF CACHE BOOL "" FORCE)
+set(GGML_CPU          OFF CACHE BOOL "" FORCE)
+set(GGML_BLAS         OFF CACHE BOOL "" FORCE)
+set(GGML_CANN         OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+
+FetchContent_Declare(
+    ggml
+    GIT_REPOSITORY https://github.com/ggml-org/ggml.git
+    GIT_TAG        v0.9.10
+    GIT_SHALLOW    TRUE
+)
+
+FetchContent_MakeAvailable(json tokenizers_cpp ggml)
 
 # Include paths
 include_directories(${CMAKE_SOURCE_DIR}/include)
@@ -144,3 +166,19 @@ target_link_libraries(test_int4_perf PRIVATE
     "-lobjc"
 )
 target_compile_options(test_int4_perf PRIVATE -O3)
+
+# ggml-metal proof of concept: load GGUF tensor, mul_mat on Metal, verify vs CPU
+add_executable(test_ggml_metal EXCLUDE_FROM_ALL
+    tests/test_ggml_metal.cpp
+)
+target_link_libraries(test_ggml_metal PRIVATE
+    ggml
+    "-framework Accelerate"
+)
+target_include_directories(test_ggml_metal PRIVATE
+    ${ggml_SOURCE_DIR}/include
+)
+target_compile_options(test_ggml_metal PRIVATE -O3)
+set_target_properties(test_ggml_metal PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+)
