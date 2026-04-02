@@ -397,6 +397,16 @@ static void flush_remaining_text(ServeRequest& req) {
     req.emitted_text = req.prev_decoded;
 }
 
+// Update session's cached_tokens with generated tokens for prefix matching on next request
+static void update_session_cache(ServeRequest& req) {
+    if (req.session && !req.generated_tokens.empty()) {
+        req.session->cached_tokens.insert(
+            req.session->cached_tokens.end(),
+            req.generated_tokens.begin(),
+            req.generated_tokens.end());
+    }
+}
+
 static void finish_request(Tokenizer& tokenizer, ServeRequest& req, const char* error = nullptr) {
     double gen_tps = req.generated_tokens.empty()
         ? 0.0
@@ -559,8 +569,6 @@ static int cmd_serve(Qwen35Model& model, Tokenizer& tokenizer, const Args& args)
                 available_sessions.pop_back();
             }
 
-            model.reset_session(*req->session);
-
             // Tokenize: apply chat template
             std::string formatted;
             if (tokenizer.has_chat_template()) {
@@ -586,27 +594,64 @@ static int cmd_serve(Qwen35Model& model, Tokenizer& tokenizer, const Args& args)
                 req->prompt_tokens.erase(req->prompt_tokens.begin(),
                                          req->prompt_tokens.begin() + drop);
             }
+
+            // KV cache prefix matching — skip re-prefill for tokens already in cache
+            int prefix_match = 0;
+            auto& cached = req->session->cached_tokens;
+            if (!cached.empty()) {
+                int check_len = std::min((int)cached.size(), (int)req->prompt_tokens.size());
+                for (int i = 0; i < check_len; i++) {
+                    if (cached[i] != req->prompt_tokens[i]) break;
+                    prefix_match = i + 1;
+                }
+            }
+
+            if (prefix_match == 0) {
+                model.reset_session(*req->session);
+            }
+            // Store full prompt tokens for next request's prefix matching
+            cached = req->prompt_tokens;
+
+            // Slice prompt to only the new (non-cached) tokens
+            int prefill_start_pos = prefix_match;
+            std::vector<int> new_tokens(
+                req->prompt_tokens.begin() + prefix_match,
+                req->prompt_tokens.end());
+
             req->prompt_token_count = (int)req->prompt_tokens.size();
             req->sampler_vocab = std::min(model.vocab_size(), tokenizer.vocab_size());
 
-            fprintf(stderr, "[prefill] %s: %d tokens...\n",
-                    req->request_id.c_str(), (int)req->prompt_tokens.size());
+            if (prefix_match > 0) {
+                fprintf(stderr, "[prefill] %s: %d tokens (%d cached, %d new)\n",
+                        req->request_id.c_str(), (int)req->prompt_tokens.size(),
+                        prefix_match, (int)new_tokens.size());
+            } else {
+                fprintf(stderr, "[prefill] %s: %d tokens...\n",
+                        req->request_id.c_str(), (int)req->prompt_tokens.size());
+            }
 
-            // GPU prefill (ggml-metal path)
+            // GPU prefill (ggml-metal path) — only process new tokens
             Timer prefill_timer;
-            req->logits = model.prefill(*req->session, req->prompt_tokens, 0);
+            req->logits = new_tokens.empty()
+                ? model.forward(*req->session, cached.back(), prefix_match - 1)
+                : model.prefill(*req->session, new_tokens, prefill_start_pos);
 
             if (!req->logits) {
                 finish_request(tokenizer, *req, "prefill failed");
+                req->session->cached_tokens.clear();
                 std::lock_guard<std::mutex> lock(mu);
                 available_sessions.push_back(std::move(req->session));
                 cv.notify_all();
                 continue;
             }
 
-            req->prompt_tps = req->prompt_tokens.empty()
-                ? 0.0
-                : req->prompt_tokens.size() / (prefill_timer.elapsed_ms() / 1000.0);
+            {
+                double prefill_ms = prefill_timer.elapsed_ms();
+                int processed = new_tokens.empty() ? 1 : (int)new_tokens.size();
+                req->prompt_tps = prefill_ms > 0
+                    ? processed / (prefill_ms / 1000.0)
+                    : 0.0;
+            }
 
             // Sample first token from prefill logits
             int limit = (req->max_tokens > 0) ? req->max_tokens : INT_MAX;
@@ -636,6 +681,7 @@ static int cmd_serve(Qwen35Model& model, Tokenizer& tokenizer, const Args& args)
 
             if (done) {
                 finish_request(tokenizer, *req);
+                update_session_cache(*req);
                 std::lock_guard<std::mutex> lock(mu);
                 available_sessions.push_back(std::move(req->session));
                 cv.notify_all();
@@ -705,6 +751,7 @@ static int cmd_serve(Qwen35Model& model, Tokenizer& tokenizer, const Args& args)
 
                     if (done) {
                         finish_request(tokenizer, *req);
+                        update_session_cache(*req);
                         std::lock_guard<std::mutex> lock(mu);
                         available_sessions.push_back(std::move(req->session));
                         cv.notify_all();
@@ -745,6 +792,7 @@ static int cmd_serve(Qwen35Model& model, Tokenizer& tokenizer, const Args& args)
                                                     decode_tokens[i], decode_positions[i]);
                         if (!req->logits) {
                             finish_request(tokenizer, *req, "generation failed");
+                            req->session->cached_tokens.clear();
                             std::lock_guard<std::mutex> lock(mu);
                             available_sessions.push_back(std::move(req->session));
                             cv.notify_all();
@@ -758,6 +806,7 @@ static int cmd_serve(Qwen35Model& model, Tokenizer& tokenizer, const Args& args)
                 if (!req || !req->session) continue;
                 if (!req->logits) {
                     finish_request(tokenizer, *req, "generation failed");
+                    req->session->cached_tokens.clear();
                     std::lock_guard<std::mutex> lock(mu);
                     available_sessions.push_back(std::move(req->session));
                     cv.notify_all();

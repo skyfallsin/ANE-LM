@@ -141,6 +141,9 @@ public:
         float* scratch_attn = nullptr;
         float* scratch_tmp = nullptr;
 
+        // KV cache prefix matching — track which tokens are already in the cache
+        std::vector<int> cached_tokens;
+
         Session() = default;
         Session(const Session&) = delete;
         Session& operator=(const Session&) = delete;

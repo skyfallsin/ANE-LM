@@ -1,0 +1,189 @@
+{
+  "config": "4B-INT8 (ane)",
+  "duration_min": 3.0,
+  "wall_time_s": 194.438,
+  "turns_completed": 7,
+  "turns_failed": 1,
+  "total_prompt_tokens": 52186,
+  "total_completion_tokens": 1256,
+  "total_tokens": 53442,
+  "avg_prefill_tok_s": 769.5,
+  "avg_decode_tok_s": 13.0,
+  "avg_cpu_mw": 9132.62887249736,
+  "avg_gpu_mw": 3223.171799315065,
+  "avg_ane_mw": 787.0739546891467,
+  "avg_combined_mw": 13142.874847207568,
+  "peak_combined_mw": 57695.3,
+  "total_energy_j": 2728.3,
+  "total_tok_per_joule": 19.6,
+  "prompt_tok_per_joule": 19.1,
+  "decode_tok_per_joule": 0.5,
+  "power_windows": [
+    {
+      "start_s": 0,
+      "end_s": 30,
+      "avg_cpu_mw": 11674.888175182483,
+      "avg_gpu_mw": 6259.061187372259,
+      "avg_ane_mw": 760.1485401459852,
+      "avg_combined_mw": 18694.097883211674,
+      "peak_combined_mw": 50290.1,
+      "total_energy_mj": 556834,
+      "thermal_pressure": "Nominal",
+      "samples": 137
+    },
+    {
+      "start_s": 30,
+      "end_s": 60,
+      "avg_cpu_mw": 6009.3469565217365,
+      "avg_gpu_mw": 166.29473833333336,
+      "avg_ane_mw": 1236.040927536233,
+      "avg_combined_mw": 7411.683623188407,
+      "peak_combined_mw": 24143.9,
+      "total_energy_mj": 223613,
+      "thermal_pressure": "Nominal",
+      "samples": 138
+    },
+    {
+      "start_s": 60,
+      "end_s": 90,
+      "avg_cpu_mw": 6963.77573529412,
+      "avg_gpu_mw": 267.08827933823517,
+      "avg_ane_mw": 1025.1776176470582,
+      "avg_combined_mw": 8256.043455882354,
+      "peak_combined_mw": 22300.8,
+      "total_energy_mj": 246907,
+      "thermal_pressure": "Nominal",
+      "samples": 136
+    },
+    {
+      "start_s": 90,
+      "end_s": 120,
+      "avg_cpu_mw": 5870.499416058392,
+      "avg_gpu_mw": 200.4243935036497,
+      "avg_ane_mw": 1004.7051532846713,
+      "avg_combined_mw": 7075.626496350366,
+      "peak_combined_mw": 25265.6,
+      "total_energy_mj": 212043,
+      "thermal_pressure": "Nominal",
+      "samples": 137
+    },
+    {
+      "start_s": 120,
+      "end_s": 150,
+      "avg_cpu_mw": 13184.21386861314,
+      "avg_gpu_mw": 7273.451004671534,
+      "avg_ane_mw": 502.50608759124077,
+      "avg_combined_mw": 20960.172189781024,
+      "peak_combined_mw": 57695.3,
+      "total_energy_mj": 633887,
+      "thermal_pressure": "Nominal",
+      "samples": 137
+    },
+    {
+      "start_s": 150,
+      "end_s": 180,
+      "avg_cpu_mw": 7078.046544117644,
+      "avg_gpu_mw": 1090.0005444852939,
+      "avg_ane_mw": 575.5320882352938,
+      "avg_combined_mw": 8743.57963235294,
+      "peak_combined_mw": 53230.7,
+      "total_energy_mj": 261503,
+      "thermal_pressure": "Nominal",
+      "samples": 136
+    }
+  ],
+  "turns": [
+    {
+      "turn": 1,
+      "prompt": "A transformer neural network processes a sequence of tokens by simultaneously transforming all input tokens using self-attention mechanisms that compute relationships between any pair of tokens regardless of their distance, allowing the model to capture long-range dependencies and contextual relationships without relying on sequential recurrence like in RNNs or LSTMs.",
+      "prompt_tokens": 6919,
+      "completion_tokens": 59,
+      "total_tokens": 6978,
+      "wall_s": 6.45192983400193,
+      "prefill_tok_s": 3615.947029864935,
+      "decode_tok_s": 13.0,
+      "error": null
+    },
+    {
+      "turn": 2,
+      "prompt": "Here's a Python function that implements **binary search** on a sorted list, with basic error handling:\n\n```python\ndef binary_search(arr, target):\n    \"\"\"\n    Perform binary search on a sorted list.\n    \n    Args:\n        arr (list): A sorted list of elements.\n        target (any): The element to search for.\n    \n    Returns:\n        int: Index of the target if found, -1 otherwise.\n    \n    Raises:\n        TypeError: If input types are invalid.\n        ValueError: If the list is empty or not sorted.\n    \"\"\"\n    # Input validation\n    if not isinstance(arr, list):\n        raise TypeError(\"Input must be a list.\")\n    if not all(isinstance(x, type(arr[0])) for x in arr):\n        raise TypeError(\"All elements in the list must have the same type.\")\n    if len(arr) == 0:\n        raise ValueError(\"The",
+      "prompt_tokens": 7005,
+      "completion_tokens": 200,
+      "total_tokens": 7205,
+      "wall_s": 22.407356167008402,
+      "prefill_tok_s": 997.4738093085401,
+      "decode_tok_s": 13.0,
+      "error": null
+    },
+    {
+      "turn": 3,
+      "prompt": "Here's a Python function that implements **binary search** on a sorted list, with basic error handling:\n\n```python\ndef binary_search(arr, target):\n    \"\"\"\n    Perform binary search on a sorted list.\n    \n    Args:\n        arr (list): A sorted list of elements.\n        target (any): The element to search for.\n    \n    Returns:\n        int: Index of the target if found, -1 otherwise.\n    \n    Raises:\n        TypeError: If input types are invalid.\n        ValueError: If the list is empty or not sorted.\n    \"\"\"\n    # Input validation\n    if not isinstance(arr, list):\n        raise TypeError(\"Input must be a list.\")\n    if len(arr) == 0:\n        raise ValueError(\"List cannot be empty.\")\n    if not all(isinstance(x, type(arr[0])) for x in arr):\n        raise TypeError(\"All elements in the",
+      "prompt_tokens": 7232,
+      "completion_tokens": 197,
+      "total_tokens": 7429,
+      "wall_s": 21.53723225000431,
+      "prefill_tok_s": 1132.941027075361,
+      "decode_tok_s": 13.0,
+      "error": null
+    },
+    {
+      "turn": 4,
+      "prompt": "**Photosynthesis** is the biological process by which green plants, algae, and some bacteria transform light energy into chemical energy. This process allows them to produce organic compounds (like glucose) from carbon dioxide and water, releasing oxygen as a byproduct. It occurs primarily in chloroplasts within plant cells.\n\n---\n\n### **Two Main Stages:**\n\n#### **1. Light-Dependent Reactions (Light Reactions)**\nThese reactions occur in the **thylakoid membranes** of chloroplasts and require sunlight.\n\n- **Location**: Thylakoid membranes (inside chloroplasts).\n- **Inputs**: Light + H\u2082O + ADP + NADP\u207a\n- **Outputs**: O\u2082, ATP, NADPH\n- **Key Steps**:\n  1. **Photon Absorption**: Chlorophyll and other pigments absorb photons.\n  2. **Water Splitting (Photolysis)**: Water molecules are",
+      "prompt_tokens": 7455,
+      "completion_tokens": 200,
+      "total_tokens": 7655,
+      "wall_s": 23.635634167003445,
+      "prefill_tok_s": 903.5247884676768,
+      "decode_tok_s": 13.0,
+      "error": null
+    },
+    {
+      "turn": 5,
+      "prompt": "The sensors in Unit 734\u2019s auditory receptors were calibrated for precision, not the chaotic fluctuation of human noise. But today, the static hum of the factory floor was replaced by something else: a rhythmic pulse that seemed to have meaning.\n\nThe unit stood still, its optical sensors focused on the rhythmic pulse. The sound seemed to have meaning.\n\nThe unit stood still, its optical sensors focused on the rhythmic pulse. The sound seemed to have meaning.\n\nThe unit stood still, its optical sensors focused on the rhythmic pulse. The sound seemed to have meaning.\n\nThe unit stood still, its optical sensors focused on the rhythmic pulse. The sound seemed to have meaning.\n\nThe unit stood still, its optical sensors focused on the rhythmic pulse. The sound seemed to have meaning.\n\nThe unit stood still, its optical sensors focused on the rhythmic pulse. The sound seemed to have meaning.\n\nThe unit stood still, its optical sensors focused on",
+      "prompt_tokens": 7679,
+      "completion_tokens": 200,
+      "total_tokens": 7879,
+      "wall_s": 23.56006054201862,
+      "prefill_tok_s": 939.2760702512107,
+      "decode_tok_s": 13.0,
+      "error": null
+    },
+    {
+      "turn": 6,
+      "prompt": "The **CAP theorem** states that a distributed data store cannot simultaneously guarantee all three of the following guarantees:\n\n1.  **Consistency**: Every read receives the most recent write or an error.\n2.  **Availability**: Every request receives a (possibly non-cached) response, without guaranteeing correctness.\n3.  **Partition Tolerance**: The system continues to operate despite any number of messages being dropped or delayed.\n\nAccording to the CAP theorem, a distributed data store cannot simultaneously guarantee all three of the following guarantees:\n\n1.  **Consistency**: Every read receives the most recent write or an error.\n2.  **Availability**: Every request receives a (possibly non-cached) response, without guaranteeing correctness.\n3.  **Partition Tolerance**: The system continues to operate despite any number of messages being dropped or delayed.\n\nAccording to the CAP theorem, a distributed data store cannot simultaneously guarantee all three of the following guarantees:\n\n1.",
+      "prompt_tokens": 7904,
+      "completion_tokens": 200,
+      "total_tokens": 8104,
+      "wall_s": 24.998789625009522,
+      "prefill_tok_s": 822.1194875781628,
+      "decode_tok_s": 13.0,
+      "error": null
+    },
+    {
+      "turn": 7,
+      "prompt": "**Garbage collection (GC)** is an automated memory management technique used to reclaim memory occupied by objects that are no longer in use. Its primary goal is to prevent memory leaks and dangling pointers, which can cause crashes or security vulnerabilities.\n\nModern programming languages generally fall into three main categories regarding garbage collection: **Reference Counting**, **Generational Garbage Collection**, and **Hybrid approaches**.\n\n---\n\n### 1. Reference Counting\nThis is the simplest form of GC. Every object has a counter indicating how many active references point to it.\n\n*   **Mechanism**:\n    1.  When an object is created, its reference count is set to 1.\n    2.  Every time a new reference is added, the count increments.\n    3.  When a reference is removed, the count decrements.\n    4.  If the count reaches zero, the object is immediately deallocated.\n*   **Pros**:",
+      "prompt_tokens": 7992,
+      "completion_tokens": 200,
+      "total_tokens": 8192,
+      "wall_s": 41.843820999987656,
+      "prefill_tok_s": 302.04988449678956,
+      "decode_tok_s": 13.0,
+      "error": null
+    },
+    {
+      "turn": 8,
+      "prompt": "",
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0,
+      "wall_s": 30.00149650001549,
+      "prefill_tok_s": 0.0,
+      "decode_tok_s": 0.0,
+      "error": "timed out"
+    }
+  ],
+  "thermal_pressures": [
+    "Nominal"
+  ],
+  "error": null
+}
