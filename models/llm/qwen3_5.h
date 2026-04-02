@@ -163,6 +163,11 @@ public:
     void reset() override;
     int vocab_size() const override { return vocab_size_; }
 
+    // Per-batch-item CPU work for forward_batch (DeltaNet SSM or full attention)
+    void forward_batch_cpu_item(Session& session, int L, bool is_linear,
+                                float* x_norm, float* proj, float* pre_oproj,
+                                int pos, int max_proj_dim) const;
+
 private:
     // Config
     int hidden_size_ = 0;

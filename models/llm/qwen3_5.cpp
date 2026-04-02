@@ -98,6 +98,11 @@ static bool qwen35_linear_z_on_cpu() {
     return enabled;
 }
 
+static bool qwen35_par_cpu() {
+    static bool enabled = getenv("ANE_NO_PAR_CPU") == nullptr;
+    return enabled;
+}
+
 static bool qwen35_batch_rmsgate() {
     static bool enabled = getenv("ANE_BATCH_RMSGATE") != nullptr;
     return enabled;
@@ -3422,6 +3427,121 @@ float* Qwen35Model::prefill_gpu(Session& session, const std::vector<int>& token_
 }
 
 
+void Qwen35Model::forward_batch_cpu_item(Session& session, int L, bool is_linear,
+                                          float* x_norm, float* proj, float* pre_oproj,
+                                          int pos, int max_proj_dim) const {
+    if (is_linear) {
+        auto& dw = layers_[L].deltanet;
+
+        float* mixed_qkv = proj;
+        float* z = proj + lin_qkv_dim_;
+        if (qwen35_linear_z_on_cpu()) {
+            matvec(z, dw.in_proj_z, x_norm, lin_total_val_, hidden_size_);
+        }
+
+        float* a_vec = session.scratch_tmp;
+        float* b_vec = session.scratch_tmp + lin_num_val_heads_;
+        matvec(a_vec, dw.in_proj_a, x_norm, lin_num_val_heads_, hidden_size_);
+        matvec(b_vec, dw.in_proj_b, x_norm, lin_num_val_heads_, hidden_size_);
+
+        float* conv_out = session.scratch_conv;
+        conv1d_update(conv_out, session.delta_conv_state[L], &session.delta_conv_pos[L], mixed_qkv, dw.conv1d_w, lin_qkv_dim_, conv_kernel_);
+        silu_vec_inplace(conv_out, lin_qkv_dim_, session.scratch_tmp + lin_num_val_heads_ * 2);
+
+        float* Q = conv_out;
+        float* K = conv_out + lin_total_key_;
+        float* V = conv_out + lin_total_key_ * 2;
+        float* y = session.scratch_y;
+        float q_scale = 1.0f / sqrtf((float)lin_key_dim_);
+        int val_heads_per_key = lin_num_val_heads_ / lin_num_heads_;
+
+        for (int kh = 0; kh < lin_num_heads_; kh++) {
+            float* qh = Q + kh * lin_key_dim_;
+            float* kh_ptr = K + kh * lin_key_dim_;
+
+            l2_normalize(qh, lin_key_dim_);
+            l2_normalize(kh_ptr, lin_key_dim_);
+            float qs = q_scale;
+            vDSP_vsmul(qh, 1, &qs, qh, 1, (vDSP_Length)lin_key_dim_);
+
+            for (int vsub = 0; vsub < val_heads_per_key; vsub++) {
+                int vh = kh * val_heads_per_key + vsub;
+                float* vh_ptr = V + vh * lin_val_dim_;
+                float* yh = y + vh * lin_val_dim_;
+                float* state = session.delta_ssm_state[L] + (size_t)vh * lin_key_dim_ * lin_val_dim_;
+
+                float beta = sigmoid_f(b_vec[vh]);
+                float decay = expf(-dw.A[vh] * softplus_f(a_vec[vh] + dw.dt_bias[vh]));
+                ssm_step(yh, state, qh, kh_ptr, vh_ptr, decay, beta, lin_key_dim_, lin_val_dim_);
+            }
+        }
+
+        if (qwen35_batch_rmsgate()) {
+            rmsnorm_gated_repeated(pre_oproj, y, z, dw.norm_w,
+                                   lin_num_val_heads_, lin_val_dim_,
+                                   session.scratch_tmp);
+        } else {
+            for (int h = 0; h < lin_num_val_heads_; h++) {
+                rmsnorm_gated(pre_oproj + h * lin_val_dim_,
+                              y + h * lin_val_dim_,
+                              z + h * lin_val_dim_,
+                              dw.norm_w, lin_val_dim_);
+            }
+        }
+    } else {
+        auto& fw = layers_[L].full_attn;
+
+        float* q_gate_raw = proj;
+        float* k_raw = proj + full_q_dim_;
+        float* v_raw = proj + full_q_dim_ + full_kv_dim_;
+
+        for (int h = 0; h < num_q_heads_; h++) {
+            float* qh = q_gate_raw + (size_t)h * head_dim_ * 2;
+            rmsnorm(qh, qh, fw.q_norm, head_dim_, rms_eps_);
+        }
+        for (int h = 0; h < num_kv_heads_; h++) {
+            rmsnorm(k_raw + h * head_dim_, k_raw + h * head_dim_, fw.k_norm, head_dim_, rms_eps_);
+        }
+
+        const float* rope_cos_row = nullptr;
+        const float* rope_sin_row = nullptr;
+        if (pos >= 0 && pos < MAX_SEQ_LEN && rope_cos_ && rope_sin_) {
+            int half_rot = rot_dim_ / 2;
+            rope_cos_row = rope_cos_ + (size_t)pos * half_rot;
+            rope_sin_row = rope_sin_ + (size_t)pos * half_rot;
+        }
+        apply_rope_cached(q_gate_raw, k_raw, num_q_heads_, num_kv_heads_,
+                          head_dim_, head_dim_ * 2, head_dim_, rot_dim_, pos, rope_theta_,
+                          rope_cos_row, rope_sin_row);
+
+        int slot;
+        if (session.kv_len[L] < KV_CACHE_CAPACITY) {
+            slot = session.kv_start[L] + session.kv_len[L];
+            if (slot >= KV_CACHE_CAPACITY) slot -= KV_CACHE_CAPACITY;
+            session.kv_len[L]++;
+        } else {
+            slot = session.kv_start[L];
+            session.kv_start[L]++;
+            if (session.kv_start[L] >= KV_CACHE_CAPACITY) session.kv_start[L] = 0;
+        }
+        size_t kv_stride = (size_t)num_kv_heads_ * head_dim_;
+        memcpy(session.kv_k_cache[L] + (size_t)slot * kv_stride, k_raw, kv_stride * sizeof(float));
+        memcpy(session.kv_v_cache[L] + (size_t)slot * kv_stride, v_raw, kv_stride * sizeof(float));
+
+        gqa_attention(pre_oproj, q_gate_raw, session.kv_k_cache[L], session.kv_v_cache[L],
+                      num_q_heads_, num_kv_heads_, head_dim_, head_dim_ * 2,
+                      session.kv_start[L], session.kv_len[L], KV_CACHE_CAPACITY);
+
+        if (attn_output_gate_) {
+            for (int h = 0; h < num_q_heads_; h++) {
+                float* oh = pre_oproj + h * head_dim_;
+                const float* gh = q_gate_raw + (size_t)h * head_dim_ * 2 + head_dim_;
+                mul_sigmoid_inplace(oh, gh, head_dim_, session.scratch_tmp);
+            }
+        }
+    }
+}
+
 bool Qwen35Model::forward_batch(Session** sessions, const int* token_ids, const int* positions, int batch) {
     if (!sessions || !token_ids || !positions || batch <= 0) return false;
     if (batch == 1) {
@@ -3495,122 +3615,48 @@ bool Qwen35Model::forward_batch(Session** sessions, const int* token_ids, const 
         if (do_profile) first_proj_ms += t_stage.elapsed_ms();
 
         t_stage.reset();
-        for (int b = 0; b < batch; b++) {
-            Session& session = *sessions[b];
-            float* x_norm = x_norm_batch.data() + (size_t)b * hidden_size_;
-            float* proj = proj_batch.data() + (size_t)b * max_proj_dim;
-            float* pre_oproj = pre_oproj_batch.data() + (size_t)b * max_attn_dim;
-            int pos = positions[b];
-
-            if (is_linear) {
-                auto& dw = layers_[L].deltanet;
-
-                float* mixed_qkv = proj;
-                float* z = proj + lin_qkv_dim_;
-                if (qwen35_linear_z_on_cpu()) {
-                    matvec(z, dw.in_proj_z, x_norm, lin_total_val_, hidden_size_);
-                }
-
-                float* a_vec = session.scratch_tmp;
-                float* b_vec = session.scratch_tmp + lin_num_val_heads_;
-                matvec(a_vec, dw.in_proj_a, x_norm, lin_num_val_heads_, hidden_size_);
-                matvec(b_vec, dw.in_proj_b, x_norm, lin_num_val_heads_, hidden_size_);
-
-                float* conv_out = session.scratch_conv;
-                conv1d_update(conv_out, session.delta_conv_state[L], &session.delta_conv_pos[L], mixed_qkv, dw.conv1d_w, lin_qkv_dim_, conv_kernel_);
-                silu_vec_inplace(conv_out, lin_qkv_dim_, session.scratch_tmp + lin_num_val_heads_ * 2);
-
-                float* Q = conv_out;
-                float* K = conv_out + lin_total_key_;
-                float* V = conv_out + lin_total_key_ * 2;
-                float* y = session.scratch_y;
-                float q_scale = 1.0f / sqrtf((float)lin_key_dim_);
-                int val_heads_per_key = lin_num_val_heads_ / lin_num_heads_;
-
-                for (int kh = 0; kh < lin_num_heads_; kh++) {
-                    float* qh = Q + kh * lin_key_dim_;
-                    float* kh_ptr = K + kh * lin_key_dim_;
-
-                    l2_normalize(qh, lin_key_dim_);
-                    l2_normalize(kh_ptr, lin_key_dim_);
-                    float qs = q_scale;
-                    vDSP_vsmul(qh, 1, &qs, qh, 1, (vDSP_Length)lin_key_dim_);
-
-                    for (int vsub = 0; vsub < val_heads_per_key; vsub++) {
-                        int vh = kh * val_heads_per_key + vsub;
-                        float* vh_ptr = V + vh * lin_val_dim_;
-                        float* yh = y + vh * lin_val_dim_;
-                        float* state = session.delta_ssm_state[L] + (size_t)vh * lin_key_dim_ * lin_val_dim_;
-
-                        float beta = sigmoid_f(b_vec[vh]);
-                        float decay = expf(-dw.A[vh] * softplus_f(a_vec[vh] + dw.dt_bias[vh]));
-                        ssm_step(yh, state, qh, kh_ptr, vh_ptr, decay, beta, lin_key_dim_, lin_val_dim_);
-                    }
-                }
-
-                if (qwen35_batch_rmsgate()) {
-                    rmsnorm_gated_repeated(pre_oproj, y, z, dw.norm_w,
-                                           lin_num_val_heads_, lin_val_dim_,
-                                           session.scratch_tmp);
-                } else {
-                    for (int h = 0; h < lin_num_val_heads_; h++) {
-                        rmsnorm_gated(pre_oproj + h * lin_val_dim_,
-                                      y + h * lin_val_dim_,
-                                      z + h * lin_val_dim_,
-                                      dw.norm_w, lin_val_dim_);
-                    }
-                }
-            } else {
-                auto& fw = layers_[L].full_attn;
-
-                float* q_gate_raw = proj;
-                float* k_raw = proj + full_q_dim_;
-                float* v_raw = proj + full_q_dim_ + full_kv_dim_;
-
-                for (int h = 0; h < num_q_heads_; h++) {
-                    float* qh = q_gate_raw + (size_t)h * head_dim_ * 2;
-                    rmsnorm(qh, qh, fw.q_norm, head_dim_, rms_eps_);
-                }
-                for (int h = 0; h < num_kv_heads_; h++) {
-                    rmsnorm(k_raw + h * head_dim_, k_raw + h * head_dim_, fw.k_norm, head_dim_, rms_eps_);
-                }
-
-                const float* rope_cos_row = nullptr;
-                const float* rope_sin_row = nullptr;
-                if (pos >= 0 && pos < MAX_SEQ_LEN && rope_cos_ && rope_sin_) {
-                    int half_rot = rot_dim_ / 2;
-                    rope_cos_row = rope_cos_ + (size_t)pos * half_rot;
-                    rope_sin_row = rope_sin_ + (size_t)pos * half_rot;
-                }
-                apply_rope_cached(q_gate_raw, k_raw, num_q_heads_, num_kv_heads_,
-                                  head_dim_, head_dim_ * 2, head_dim_, rot_dim_, pos, rope_theta_,
-                                  rope_cos_row, rope_sin_row);
-
-                int slot;
-                if (session.kv_len[L] < KV_CACHE_CAPACITY) {
-                    slot = session.kv_start[L] + session.kv_len[L];
-                    if (slot >= KV_CACHE_CAPACITY) slot -= KV_CACHE_CAPACITY;
-                    session.kv_len[L]++;
-                } else {
-                    slot = session.kv_start[L];
-                    session.kv_start[L]++;
-                    if (session.kv_start[L] >= KV_CACHE_CAPACITY) session.kv_start[L] = 0;
-                }
-                size_t kv_stride = (size_t)num_kv_heads_ * head_dim_;
-                memcpy(session.kv_k_cache[L] + (size_t)slot * kv_stride, k_raw, kv_stride * sizeof(float));
-                memcpy(session.kv_v_cache[L] + (size_t)slot * kv_stride, v_raw, kv_stride * sizeof(float));
-
-                gqa_attention(pre_oproj, q_gate_raw, session.kv_k_cache[L], session.kv_v_cache[L],
-                              num_q_heads_, num_kv_heads_, head_dim_, head_dim_ * 2,
-                              session.kv_start[L], session.kv_len[L], KV_CACHE_CAPACITY);
-
-                if (attn_output_gate_) {
-                    for (int h = 0; h < num_q_heads_; h++) {
-                        float* oh = pre_oproj + h * head_dim_;
-                        const float* gh = q_gate_raw + (size_t)h * head_dim_ * 2 + head_dim_;
-                        mul_sigmoid_inplace(oh, gh, head_dim_, session.scratch_tmp);
-                    }
-                }
+        // Parallel dispatch: each batch item's SSM/attention is independent
+        // (separate Session state, separate slices of proj/pre_oproj buffers)
+        const bool par_cpu = qwen35_par_cpu() && batch > 1;
+        if (par_cpu) {
+            // Pack context for dispatch_apply_f (avoids Obj-C block + C++ lambda issues)
+            struct BatchCpuCtx {
+                Qwen35Model* self;
+                Session** sessions;
+                const int* positions;
+                float* x_norm_data;
+                float* proj_data;
+                float* pre_oproj_data;
+                int hidden_size;
+                int max_proj_dim;
+                int max_attn_dim;
+                int L;
+                bool is_linear;
+            };
+            BatchCpuCtx ctx {
+                const_cast<Qwen35Model*>(this), sessions, positions,
+                x_norm_batch.data(), proj_batch.data(), pre_oproj_batch.data(),
+                hidden_size_, max_proj_dim, max_attn_dim, L, is_linear
+            };
+            dispatch_apply_f((size_t)batch,
+                dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
+                &ctx, [](void* raw_ctx, size_t b) {
+                    auto* c = (BatchCpuCtx*)raw_ctx;
+                    c->self->forward_batch_cpu_item(
+                        *c->sessions[b], c->L, c->is_linear,
+                        c->x_norm_data + (size_t)b * c->hidden_size,
+                        c->proj_data + (size_t)b * c->max_proj_dim,
+                        c->pre_oproj_data + (size_t)b * c->max_attn_dim,
+                        c->positions[b], c->max_proj_dim);
+                });
+        } else {
+            for (int b = 0; b < batch; b++) {
+                forward_batch_cpu_item(
+                    *sessions[b], L, is_linear,
+                    x_norm_batch.data() + (size_t)b * hidden_size_,
+                    proj_batch.data() + (size_t)b * max_proj_dim,
+                    pre_oproj_batch.data() + (size_t)b * max_attn_dim,
+                    positions[b], max_proj_dim);
             }
         }
         if (do_profile) core_cpu_ms += t_stage.elapsed_ms();
