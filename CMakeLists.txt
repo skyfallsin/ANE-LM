@@ -144,33 +144,8 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-# Test target for quantized weight benchmarks (minimal deps)
-add_executable(test_quant_perf EXCLUDE_FROM_ALL
-    ../apple-neural-engine-field-guide/tests/test_quantized_weight_perf_v2.cpp
-    core/ane_runtime.cpp
-    common.cpp
-)
-target_link_libraries(test_quant_perf PRIVATE
-    "-framework Foundation"
-    "-framework IOSurface"
-    "-framework Accelerate"
-    "-lobjc"
-)
-target_compile_options(test_quant_perf PRIVATE -O3)
-
-# INT4 benchmark test
-add_executable(test_int4_perf EXCLUDE_FROM_ALL
-    ../apple-neural-engine-field-guide/tests/test_int4_weight_perf.cpp
-    core/ane_runtime.cpp
-    common.cpp
-)
-target_link_libraries(test_int4_perf PRIVATE
-    "-framework Foundation"
-    "-framework IOSurface"
-    "-framework Accelerate"
-    "-lobjc"
-)
-target_compile_options(test_int4_perf PRIVATE -O3)
+# Test targets for quantized weight benchmarks (removed — source files no longer exist)
+# test_quant_perf and test_int4_perf were in apple-neural-engine-field-guide/tests/
 
 # ggml-metal proof of concept: load GGUF tensor, mul_mat on Metal, verify vs CPU
 add_executable(test_ggml_metal EXCLUDE_FROM_ALL
